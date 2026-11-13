@@ -3,9 +3,9 @@
 A Windows desktop app for a **plan → expand → implement** coding pipeline:
 
 1. You type a short instruction ("add a retry with backoff to the HTTP client").
-2. **Claude** expands it into a detailed spec: files, signatures, step-by-step changes, edge cases, acceptance criteria.
+2. **Claude** expands it into a detailed spec: files, signatures, step-by-step changes, edge cases, acceptance criteria. Claude only plans and describes — in words, names and signatures; it does not write the code.
 3. You review and edit the spec.
-4. A **local LLM** (llama.cpp on your GPU) implements the spec as SEARCH/REPLACE edits.
+4. A **local LLM** (llama.cpp on your GPU) writes all of the code, as SEARCH/REPLACE edits.
 5. You review side-by-side diffs and accept or reject each file; accepted files are written to the project.
 6. *(Optional)* Claude reviews the applied diff against the spec and can write a follow-up spec.
 
@@ -151,7 +151,7 @@ Profiles live in `%LOCALAPPDATA%\Relay\profiles.json`.
 
 Settings → **Prompt templates** (files in `%LOCALAPPDATA%\Relay\templates`):
 
-* `expand.md` — instruction → spec (Claude). Placeholders: `{{instruction}} {{model_name}} {{context_limit}} {{project_name}} {{file_tree}} {{context_files}} {{explore_note}} {{budget_guidance}}`. The budget guidance is computed from the active profile's context limit so Claude writes tighter, self-contained per-file sections for smaller contexts.
+* `expand.md` — instruction → spec (Claude). It tells Claude to describe changes without writing code (inline names, signatures and literal values only); a spec containing multi-line code blocks gets a warning in the Spec pane. Placeholders: `{{instruction}} {{model_name}} {{context_limit}} {{project_name}} {{file_tree}} {{context_files}} {{explore_note}} {{budget_guidance}}`. The budget guidance is computed from the active profile's context limit so Claude writes tighter, self-contained per-file sections for smaller contexts.
 * `implement-system.md` — the local model's system prompt (edit-format rules).
 * `review.md` — review prompt. Placeholders: `{{spec}} {{diff}} {{files_after}}`.
 
@@ -213,7 +213,7 @@ Instruction *"add a retry with backoff to the HTTP client"* on a small Python pr
 | Qwen3.6-35B-A3B | ✓ | 1 | 68 tok/s | 12 s |
 | gpt-oss-20b | ✓ in 3/3 runs | 1, 2, 1 | 188 tok/s | 6–11 s |
 
-The first gpt-oss run failed (a SEARCH started with one blank line too many, and the retry "thought out loud" inside its answer). That led to two changes: the edit-format prompt now requires SEARCH to start and end on non-blank lines, and the retry message names near-misses precisely ("your SEARCH starts with 3 blank lines but the file has 2 before line 5", "matches only if indentation is ignored"). Matching itself stays exact. The Qwen3.8-27B run on the hand-written spec in `examples/e2e.rs` produced code that passes the spec's acceptance checks when executed.
+These runs predate the no-code rule for specs (the specs still contained code), so they measure copying more than implementing; re-measure with prose-only specs. The first gpt-oss run failed (a SEARCH started with one blank line too many, and the retry "thought out loud" inside its answer). That led to two changes: the edit-format prompt now requires SEARCH to start and end on non-blank lines, and the retry message names near-misses precisely ("your SEARCH starts with 3 blank lines but the file has 2 before line 5", "matches only if indentation is ignored"). Matching itself stays exact. The Qwen3.8-27B run on the hand-written spec in `examples/e2e.rs` produced code that passes the spec's acceptance checks when executed.
 
 ### Layout
 

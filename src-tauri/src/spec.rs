@@ -49,6 +49,10 @@ pub struct ParsedSpec {
     pub warnings: Vec<String>,
 }
 
+/// A fenced block with at least this many non-blank lines counts as code (a one- or two-line
+/// fence holding a signature or a literal value is fine).
+pub const CODE_BLOCK_MIN_LINES: usize = 3;
+
 static BACKTICK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`\n]+)`").unwrap());
 static ACTION_TAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\((?:modify|create|new|edit|delete|remove|update|new file)\)").unwrap());
@@ -149,6 +153,10 @@ pub fn parse_spec(md: &str) -> ParsedSpec {
     let mut acc = Vec::new();
     let mut current_change: Option<(String, Vec<String>)> = None;
     let mut in_fence = false;
+    // Code in the spec: (blocks with at least CODE_BLOCK_MIN_LINES lines, their total lines).
+    let mut fence_lines = 0usize;
+    let mut code_blocks = 0usize;
+    let mut code_lines = 0usize;
 
     let flush_change = |spec: &mut ParsedSpec, cur: &mut Option<(String, Vec<String>)>| {
         if let Some((p, body)) = cur.take() {
@@ -158,7 +166,14 @@ pub fn parse_spec(md: &str) -> ParsedSpec {
 
     for line in text.lines() {
         if line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~") {
+            if in_fence && fence_lines >= CODE_BLOCK_MIN_LINES {
+                code_blocks += 1;
+                code_lines += fence_lines;
+            }
             in_fence = !in_fence;
+            fence_lines = 0;
+        } else if in_fence && !line.trim().is_empty() {
+            fence_lines += 1;
         }
         if !in_fence && let Some(cap) = HEADING.captures(line) {
             let level = cap[1].len();
@@ -246,6 +261,12 @@ pub fn parse_spec(md: &str) -> ParsedSpec {
     }
     spec.mentioned_paths = mentioned;
 
+    if code_blocks > 0 {
+        spec.warnings.push(format!(
+            "The spec contains code ({code_lines} lines in {code_blocks} block(s)). Specs should describe the changes in words, names and signatures; \
+             the local model is meant to write the code. Remove the code or regenerate the spec."
+        ));
+    }
     if spec.files.is_empty() {
         spec.warnings
             .push("The spec has no `## Files` list, so the files to edit are unknown.".into());
@@ -416,6 +437,21 @@ Export it.
         assert!(p.contains("`src/http/client.ts` (modify) — handled in a separate step"));
         assert!(p.contains("## Edge cases"));
         assert!(p.contains("## Acceptance criteria"));
+    }
+
+    #[test]
+    fn code_in_spec_is_flagged_but_short_signatures_are_fine() {
+        let with_code = "## Files\n- `a.py` (modify)\n## Changes\n### `a.py`\nAdd:\n```python\ndef f(x):\n    if x:\n        return 1\n    return 2\n```\n";
+        let s = parse_spec(with_code);
+        assert!(
+            s.warnings.iter().any(|w| w.contains("contains code (4 lines in 1 block(s))")),
+            "{:?}",
+            s.warnings
+        );
+
+        let signature_only = "## Files\n- `a.py` (modify)\n## Changes\n### `a.py`\nAdd a function:\n```python\ndef f(x: int) -> int\n```\nthat returns 1 for truthy `x`, else 2.\n";
+        let s = parse_spec(signature_only);
+        assert!(!s.warnings.iter().any(|w| w.contains("contains code")), "{:?}", s.warnings);
     }
 
     #[test]
