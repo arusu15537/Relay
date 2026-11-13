@@ -1,0 +1,11 @@
+[package]
+name = "fake-llama-server"
+version = "0.1.0"
+edition = "2021"
+description = "Test double for llama-server: same CLI/log/HTTP surface, scripted or synthetic answers, no GPU."
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+opt-level = 1
