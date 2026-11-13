@@ -8,6 +8,7 @@ pub mod editformat;
 pub mod events;
 pub mod history;
 pub mod llm;
+pub mod outline;
 pub mod pathsafe;
 pub mod pipeline;
 pub mod project;

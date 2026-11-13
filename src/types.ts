@@ -62,6 +62,7 @@ export interface Settings {
   reviewEnabled: boolean;
   autoFallback: boolean;
   fallbackProfile: string;
+  outlineContext: boolean;
   lastProject: string;
   loadTimeoutSecs: number;
   loadStats: Record<string, number>;
@@ -151,7 +152,12 @@ export interface PreparedFile {
   exists: boolean;
   target: boolean;
   action: FileAction | null;
+  /** Tokens sent to the model (the outline's size when `outline`). */
   tokens: number;
+  fullTokens: number;
+  /** Set for context files where an outline is available and worthwhile. */
+  outlineTokens: number | null;
+  outline: boolean;
   error: string | null;
 }
 

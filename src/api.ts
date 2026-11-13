@@ -20,8 +20,8 @@ export const api = {
   expand: (req: { jobId: string; instruction: string; projectRoot: string; contextFiles: string[]; profileId: string }) =>
     invoke<T.ExpandResult>("expand", { req }),
   parseSpec: (spec: string) => invoke<T.ParsedSpec>("parse_spec_cmd", { spec }),
-  prepareImplement: (root: string, spec: string, contextFiles: string[], profileId: string) =>
-    invoke<T.Prepared>("prepare_implement", { root, spec, contextFiles, profileId }),
+  prepareImplement: (root: string, spec: string, contextFiles: string[], fullContext: string[], profileId: string) =>
+    invoke<T.Prepared>("prepare_implement", { root, spec, contextFiles, fullContext, profileId }),
   implement: (cmd: {
     jobId: string;
     runId: string;
@@ -31,6 +31,7 @@ export const api = {
     contextFiles: string[];
     mode: T.SplitMode | null;
     profileId: string;
+    fullContext: string[];
   }) => invoke<T.ImplementResponse>("implement", { cmd }),
   cancelJob: (id: string) => invoke<boolean>("cancel_job", { id }),
   acceptFile: (runId: string, path: string, content: string | null, force: boolean) =>

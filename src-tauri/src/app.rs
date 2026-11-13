@@ -7,7 +7,7 @@ use crate::editformat::{Workspace, parse_blocks};
 use crate::events::Sink;
 use crate::history::{History, JobRecord};
 use crate::llm::{ChatMessage, Endpoint, build_body, stream_chat};
-use crate::pipeline::{self, ImplementRequest, ImplementResult, Prepared, RunContext};
+use crate::pipeline::{self, ContextOptions, ImplementRequest, ImplementResult, Prepared, RunContext};
 use crate::project::{self, WriteConflict};
 use crate::reasoning::strip_reasoning;
 use crate::server::{ServerManager, ServerState, ServerStatus};
@@ -71,6 +71,9 @@ pub struct ImplementCommand {
     #[serde(default)]
     pub mode: Option<SplitMode>,
     pub profile_id: String,
+    /// Context files to send in full even when outlines are on (Settings → context outlines).
+    #[serde(default)]
+    pub full_context: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,15 +419,30 @@ impl AppCore {
 
     // ----- implement --------------------------------------------------------------------------
 
-    pub fn prepare(&self, root: &str, spec: &str, context_files: &[String], profile_id: &str) -> Result<Prepared> {
+    pub fn prepare(
+        &self,
+        root: &str,
+        spec: &str,
+        context_files: &[String],
+        full_context: &[String],
+        profile_id: &str,
+    ) -> Result<Prepared> {
         let profile = self.profile(profile_id)?;
         Ok(pipeline::prepare(
             Path::new(root),
             spec,
             context_files,
+            &self.context_options(full_context),
             &profile,
             &templates::load(Template::ImplementSystem),
         ))
+    }
+
+    fn context_options(&self, full_context: &[String]) -> ContextOptions {
+        ContextOptions {
+            outlines: self.settings().outline_context,
+            full: full_context.to_vec(),
+        }
     }
 
     pub async fn implement(&self, cmd: ImplementCommand) -> Result<ImplementResponse> {
@@ -463,6 +481,7 @@ impl AppCore {
             spec: cmd.spec.clone(),
             context_files: cmd.context_files.clone(),
             mode: cmd.mode,
+            context_options: self.context_options(&cmd.full_context),
         };
         let result = pipeline::implement(&ctx, &req).await;
         self.finish_job(&run_id);

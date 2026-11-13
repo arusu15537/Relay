@@ -435,6 +435,17 @@ textarea {
 .chip.ctx {
   color: var(--muted);
 }
+button.chip {
+  padding: 1px 7px;
+  border-radius: 10px;
+  border-color: var(--border);
+  background: var(--panel-2);
+}
+.chip .tag {
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  color: var(--accent);
+}
 .chip.err {
   border-color: var(--err);
   color: var(--err);
