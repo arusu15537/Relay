@@ -15,10 +15,11 @@ What should change and why, in 2–5 sentences.
 ## Changes
 
 ### \`path/to/file.ext\`
-1. Exactly where and what to change, with signatures and code.
+1. Exactly where and what to change: signatures (\`name(arg: type) -> type\`) and the behaviour in words.
+   Describe the logic; the local model writes the code.
 
 ### \`path/to/new_file.ext\`
-Complete intended content.
+Everything the file must contain (imports, constants, functions with signatures) and what each one does.
 
 ## Edge cases
 - …

@@ -74,37 +74,16 @@ Add automatic retries with exponential backoff to `HttpClient._request` for tran
 1. Add `import urllib.error` after `import urllib.parse`.
 2. Add `from .retry import retry_with_backoff` after the existing imports (blank line before the class stays).
 3. Change `__init__(self, base_url, timeout=10)` to `__init__(self, base_url, timeout=10, max_retries=3, backoff_base=0.5)` and store both new arguments as `self.max_retries` and `self.backoff_base`.
-4. Replace the body of `_request` so that it builds the request exactly as now, then defines an inner function `send()` containing the existing `with urllib.request.urlopen(...)` block, and returns `retry_with_backoff(send, retries=self.max_retries, base_delay=self.backoff_base, should_retry=_is_transient)`.
-5. Add a module-level function after the class:
-```python
-def _is_transient(exc):
-    if isinstance(exc, urllib.error.HTTPError):
-        return 500 <= exc.code < 600
-    return isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError))
-```
+4. Change `_request` so that it still builds the `urllib.request.Request` and adds the `Content-Type` header exactly as now, but moves the existing `with urllib.request.urlopen(...)` block (open, read, decode, `json.loads`) into an inner function `send()` that takes no arguments and returns the parsed JSON. `_request` then returns `retry_with_backoff(send, retries=self.max_retries, base_delay=self.backoff_base, should_retry=_is_transient)`.
+5. Add a module-level function `_is_transient(exc) -> bool` after the class. It returns True for an `urllib.error.HTTPError` whose `code` is between 500 and 599 inclusive, False for any other `HTTPError`, True for `urllib.error.URLError`, `TimeoutError` and `ConnectionError`, and False for everything else. Check `HTTPError` first, because it is a subclass of `URLError`.
 
 ### `src/retry.py`
-Create the file with exactly:
-```python
-import time
-
-
-def retry_with_backoff(fn, retries=3, base_delay=0.5, should_retry=lambda exc: True, sleep=time.sleep):
-    """Call fn(); on a retryable exception wait base_delay * 2**attempt and try again.
-
-    Makes at most retries + 1 calls. Re-raises the last exception when attempts run out
-    or when should_retry(exc) is False.
-    """
-    attempt = 0
-    while True:
-        try:
-            return fn()
-        except Exception as exc:
-            if attempt >= retries or not should_retry(exc):
-                raise
-            sleep(base_delay * (2 ** attempt))
-            attempt += 1
-```
+Create the file. It imports `time` and defines one function:
+`retry_with_backoff(fn, retries=3, base_delay=0.5, should_retry=lambda exc: True, sleep=time.sleep)`.
+1. Give it a docstring saying it calls `fn()` and retries retryable exceptions with exponential backoff, making at most `retries + 1` calls.
+2. Keep an attempt counter starting at 0. In a loop, call `fn()` and return its result if it succeeds.
+3. If `fn()` raises an `Exception`: re-raise that same exception unchanged when the counter is already equal to or greater than `retries`, or when `should_retry(exc)` is False. Otherwise call `sleep(base_delay * 2 ** counter)`, increase the counter by 1, and loop again.
+4. Exceptions that are not subclasses of `Exception` (e.g. `KeyboardInterrupt`) are not caught.
 
 ## Edge cases
 - 4xx responses (`HTTPError` with code < 500) are not retried.
@@ -273,6 +252,10 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
 
     let prep = core.prepare(&root, RETRY_SPEC, &[], "qwen3.8-27b").unwrap();
     c.check(prep.files.iter().filter(|f| f.target).count() == 2, "spec parsed: 2 target files");
+    c.check(
+        prep.spec.warnings.is_empty(),
+        format!("hand-written spec has no warnings (no code): {:?}", prep.spec.warnings),
+    );
     c.check(
         prep.budget.recommended == SplitMode::Single,
         format!(

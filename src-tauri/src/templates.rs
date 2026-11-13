@@ -154,7 +154,13 @@ mod tests {
         ] {
             assert!(e.contains(k), "expand template lacks {k}");
         }
+        assert!(
+            e.contains("Do not write the implementation"),
+            "the expand template must forbid code"
+        );
+        assert!(!e.contains("include the code"), "the expand template must not invite code");
         assert!(Template::Review.default_text().contains("=== FOLLOW-UP SPEC ==="));
+        assert!(Template::Review.default_text().contains("do not write the code"));
         assert!(Template::ImplementSystem.default_text().contains("<<<<<<< SEARCH"));
     }
 }

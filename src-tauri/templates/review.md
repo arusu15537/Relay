@@ -22,4 +22,4 @@ If the verdict is NEEDS_FIXES, end your answer with a line containing exactly
 
 === FOLLOW-UP SPEC ===
 
-followed by a complete follow-up spec that fixes only the problems, written against the CURRENT code (after the diff above), using exactly these sections: `## Summary`, `## Files` (bullets: `path` (modify|create) — purpose), `## Changes` (one `### `path`` subsection per file, self-contained, with exact locations, signatures and code), `## Edge cases`, `## Acceptance criteria`. The implementing model only sees that spec and the listed files, so be explicit.
+followed by a complete follow-up spec that fixes only the problems, written against the CURRENT code (after the diff above), using exactly these sections: `## Summary`, `## Files` (bullets: `path` (modify|create) — purpose), `## Changes` (one `### `path`` subsection per file, self-contained, with exact locations, signatures and precise step-by-step descriptions — describe the fix in words, do not write the code), `## Edge cases`, `## Acceptance criteria`. The implementing model only sees that spec and the listed files, so be explicit; it writes all of the code itself.
