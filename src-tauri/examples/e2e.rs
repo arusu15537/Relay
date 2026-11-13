@@ -313,6 +313,27 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
         r.avg_tok_per_sec.is_some(),
         format!("tok/s reported: {:?}", r.avg_tok_per_sec.map(|t| (t * 10.0).round() / 10.0)),
     );
+    // The same job again on the same model: the server should take the whole prompt from its cache.
+    let again = core
+        .implement(ImplementCommand {
+            job_id: "job-a-cache".into(),
+            run_id: Some("run-a-cache".into()),
+            project_root: root.clone(),
+            instruction: "same job again (prompt cache)".into(),
+            spec: RETRY_SPEC.into(),
+            context_files: vec!["src/models.py".into()],
+            full_context: vec![],
+            mode: None,
+            profile_id: "qwen3.8-27b".into(),
+        })
+        .await
+        .unwrap();
+    let a2 = again.result.calls.first().and_then(|c| c.attempts.first());
+    let (p2, c2) = (a2.and_then(|a| a.prompt_tokens), a2.and_then(|a| a.cached_tokens));
+    c.check(
+        matches!((p2, c2), (Some(p), Some(cached)) if f64::from(cached) >= 0.9 * f64::from(p)),
+        format!("same job again: prompt served from the cache ({c2:?} of {p2:?} tokens)"),
+    );
     if mode == "real" {
         for call in &r.calls {
             for a in &call.attempts {
@@ -397,6 +418,15 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
             first.outcomes.iter().any(|o| o.closest.is_some()),
             "first attempt reported the closest matching lines",
         );
+        if let Some(second) = resp.result.calls[0].attempts.get(1) {
+            c.check(
+                second.cached_tokens.unwrap_or(0) >= first.prompt_tokens.unwrap_or(u32::MAX),
+                format!(
+                    "retry reuses the first attempt's prompt from the cache ({:?} cached ≥ {:?})",
+                    second.cached_tokens, first.prompt_tokens
+                ),
+            );
+        }
 
         println!("\n== Validation fails twice → fallback offered");
         set_script(script, serde_json::json!([{"contains": "", "response": bad}]));
@@ -583,6 +613,21 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
         c.check(
             resp.result.mode == SplitMode::PerFile && resp.result.calls.len() == 2 && resp.result.validation_ok,
             format!("2 per-file calls, valid: {}", resp.result.validation_ok),
+        );
+        let cached = |i: usize| {
+            resp.result
+                .calls
+                .get(i)
+                .and_then(|c| c.attempts.first())
+                .and_then(|a| a.cached_tokens)
+        };
+        let system = relay_lib::templates::load(relay_lib::templates::Template::ImplementSystem).len() as u32 / 4;
+        c.check(
+            cached(1).is_some_and(|t| t >= system),
+            format!(
+                "second per-file call reuses the shared prefix ({:?} cached, system prompt ≈{system})",
+                cached(1)
+            ),
         );
 
         println!("\n== Cancel a running generation");

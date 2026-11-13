@@ -67,7 +67,8 @@ function AttemptDetails({ a }: { a: AttemptReport }) {
         <span className="faint">
           {a.blocks} block(s){a.tokPerSec ? ` · ${a.tokPerSec.toFixed(1)} tok/s` : ""}
           {a.completionTokens ? ` · ${a.completionTokens} tokens` : ""}
-          {a.promptTokens ? ` · prompt ${a.promptTokens}` : ""} · {fmtSecs(a.durationMs)}
+          {a.promptTokens ? ` · prompt ${a.promptTokens}` : ""}
+          {a.promptTokens && a.cachedTokens != null ? ` (${a.cachedTokens} from cache)` : ""} · {fmtSecs(a.durationMs)}
           {a.finishReason ? ` · ${a.finishReason}` : ""}
         </span>
       </div>

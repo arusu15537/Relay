@@ -41,6 +41,13 @@ try {
   await c.wait("!!document.querySelector('.diff-box .monaco-diff-editor')", 10000, "diff editor");
   await new Promise((r) => setTimeout(r, 800));
   await c.shot(`${OUT}/ui-4-diff.png`);
+  // Model calls list each attempt's prompt tokens and how many came from the server's prompt cache.
+  await c.ev("document.querySelector('details.calls')?.setAttribute('open', '')");
+  await new Promise((r) => setTimeout(r, 300));
+  const callsText = await c.ev("document.querySelector('details.calls')?.textContent || ''");
+  check(/prompt \d+ \(\d+ from cache\)/.test(callsText), `model calls show prompt-cache reuse: "${callsText.match(/prompt \d+[^·]*/)?.[0]}"`);
+  await c.shot(`${OUT}/ui-4b-calls.png`);
+  await c.ev("document.querySelector('details.calls')?.removeAttribute('open')");
 
   // Accept both files (repo is clean → no modal).
   await c.click("Accept all");
