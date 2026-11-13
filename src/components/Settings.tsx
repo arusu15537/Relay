@@ -1,7 +1,7 @@
 import Editor from "@monaco-editor/react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
-import { saveProfiles, saveSettings, switchProfile } from "../actions";
+import { saveProfiles, saveSettings, schedulePrepare, switchProfile } from "../actions";
 import { api, errText, fmtBytes } from "../api";
 import { ask, set, toast, useStore } from "../store";
 import type { HfFile, ModelFileStatus, Profile, ProfileTest, TemplateInfo } from "../types";
@@ -91,6 +91,21 @@ function General() {
       <Field label="Review step" hint="After you accept changes, Claude reviews the applied diff against the spec and can write a follow-up spec.">
         <label className="row">
           <input type="checkbox" checked={s.reviewEnabled} onChange={(e) => saveSettings({ reviewEnabled: e.target.checked })} /> Review automatically after accepting
+        </label>
+      </Field>
+      <Field
+        label="Context outlines"
+        hint="Large read-only context files (ticked or mentioned in the spec, not edited) go to the local model as outlines: imports, declarations, signatures and docstrings, with function bodies omitted. Click a file chip in the Spec pane to send that file in full."
+      >
+        <label className="row">
+          <input
+            type="checkbox"
+            checked={s.outlineContext}
+            onChange={(e) => {
+              void saveSettings({ outlineContext: e.target.checked }).then(() => schedulePrepare(0));
+            }}
+          />{" "}
+          Send large context files as outlines
         </label>
       </Field>
       <Field label="Auto-fallback" hint="If a model's output fails edit-format validation twice, offer to retry the same spec with the fallback profile.">

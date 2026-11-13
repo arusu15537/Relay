@@ -100,6 +100,14 @@ fn make_project(dir: &Path) {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/http_client.py"), CLIENT_PY).unwrap();
     std::fs::write(dir.join("src/__init__.py"), "").unwrap();
+    // A read-only context file large enough to be sent as an outline.
+    let mut models = String::from("\"\"\"Response models.\"\"\"\nimport dataclasses\n\n");
+    for i in 0..30 {
+        models.push_str(&format!(
+            "\n@dataclasses.dataclass\nclass Model{i}:\n    \"\"\"Model {i}.\"\"\"\n\n    id: int\n    name: str\n\n    def describe(self, verbose=False):\n        text = f\"{{self.id}}: {{self.name}}\"\n        if verbose:\n            text += \" (model {i})\"\n        return text\n\n"
+        ));
+    }
+    std::fs::write(dir.join("src/models.py"), models).unwrap();
     std::fs::write(dir.join("README.md"), "# demo\n\nA tiny HTTP client used to test Relay.\n").unwrap();
     std::fs::write(dir.join(".gitignore"), "__pycache__/\n").unwrap();
     let git = |args: &[&str]| {
@@ -250,11 +258,28 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
         "server log captured",
     );
 
-    let prep = core.prepare(&root, RETRY_SPEC, &[], "qwen3.8-27b").unwrap();
+    let prep = core.prepare(&root, RETRY_SPEC, &[], &[], "qwen3.8-27b").unwrap();
     c.check(prep.files.iter().filter(|f| f.target).count() == 2, "spec parsed: 2 target files");
     c.check(
         prep.spec.warnings.is_empty(),
         format!("hand-written spec has no warnings (no code): {:?}", prep.spec.warnings),
+    );
+    let ctx = ["src/models.py".to_string()];
+    let outlined = core.prepare(&root, RETRY_SPEC, &ctx, &[], "qwen3.8-27b").unwrap();
+    let m = outlined.files.iter().find(|f| f.path == "src/models.py");
+    c.check(
+        m.is_some_and(|f| f.outline && !f.target && f.tokens * 4 < f.full_tokens * 3),
+        format!(
+            "large context file sent as an outline (≈{:?} of ≈{:?} tokens)",
+            m.map(|f| f.tokens),
+            m.map(|f| f.full_tokens)
+        ),
+    );
+    let full = core.prepare(&root, RETRY_SPEC, &ctx, &ctx, "qwen3.8-27b").unwrap();
+    let m = full.files.iter().find(|f| f.path == "src/models.py");
+    c.check(
+        m.is_some_and(|f| !f.outline && f.tokens == f.full_tokens),
+        "the same file in full when asked",
     );
     c.check(
         prep.budget.recommended == SplitMode::Single,
@@ -271,7 +296,8 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
             project_root: root.clone(),
             instruction: "add retry with backoff to the HTTP client".into(),
             spec: RETRY_SPEC.into(),
-            context_files: vec![],
+            context_files: vec!["src/models.py".into()],
+            full_context: vec![],
             mode: None,
             profile_id: "qwen3.8-27b".into(),
         })
@@ -355,6 +381,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                 instruction: "retry test".into(),
                 spec: spec.into(),
                 context_files: vec![],
+                full_context: vec![],
                 mode: None,
                 profile_id: "qwen3.8-27b".into(),
             })
@@ -381,6 +408,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                 instruction: "fail test".into(),
                 spec: spec.into(),
                 context_files: vec![],
+                full_context: vec![],
                 mode: None,
                 profile_id: "qwen3.8-27b".into(),
             })
@@ -405,6 +433,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                 instruction: "evil".into(),
                 spec: "## Summary\nx\n".into(),
                 context_files: vec![],
+                full_context: vec![],
                 mode: None,
                 profile_id: "qwen3.8-27b".into(),
             })
@@ -499,6 +528,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                 instruction: "ext".into(),
                 spec: RETRY_SPEC.into(),
                 context_files: vec![],
+                full_context: vec![],
                 mode: None,
                 profile_id: "lmstudio".into(),
             })
@@ -528,7 +558,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
         std::fs::write(project.join("src/big_a.py"), &big).unwrap();
         std::fs::write(project.join("src/big_b.py"), &big).unwrap();
         let spec = "## Summary\nTouch both.\n## Files\n- `src/big_a.py` (modify)\n- `src/big_b.py` (modify)\n## Changes\n### `src/big_a.py`\nAppend a comment.\n### `src/big_b.py`\nAppend a comment.\n";
-        let prep = core.prepare(&root, spec, &[], "tiny-ctx").unwrap();
+        let prep = core.prepare(&root, spec, &[], &[], "tiny-ctx").unwrap();
         c.check(
             prep.budget.recommended == SplitMode::PerFile,
             format!(
@@ -544,6 +574,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                 instruction: "split".into(),
                 spec: spec.into(),
                 context_files: vec![],
+                full_context: vec![],
                 mode: None,
                 profile_id: "tiny-ctx".into(),
             })
@@ -572,6 +603,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                 instruction: "cancel".into(),
                 spec: RETRY_SPEC.into(),
                 context_files: vec![],
+                full_context: vec![],
                 mode: None,
                 profile_id: "gpt-oss-20b".into(),
             })
@@ -654,6 +686,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                             instruction: String::new(),
                             spec: ex.spec.clone(),
                             context_files: vec![],
+                            full_context: vec![],
                             mode: None,
                             profile_id: "qwen3.8-27b".into(),
                         })

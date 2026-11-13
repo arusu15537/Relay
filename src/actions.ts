@@ -179,7 +179,7 @@ export async function pickProject() {
 export async function openProject(root: string) {
   try {
     const list = await api.listFiles(root);
-    set({ root, files: list.files, filesTruncated: list.truncated, checked: [] });
+    set({ root, files: list.files, filesTruncated: list.truncated, checked: [], fullContext: [] });
     saveSettings({ lastProject: root });
     refreshGit();
     schedulePrepare();
@@ -210,6 +210,12 @@ export function toggleChecked(paths: string[], on: boolean) {
     return { checked: [...cur] };
   });
   schedulePrepare();
+}
+
+/** Send a read-only context file in full instead of as an outline, or back. */
+export function toggleFullContext(path: string) {
+  set((s) => ({ fullContext: s.fullContext.includes(path) ? s.fullContext.filter((p) => p !== path) : [...s.fullContext, path] }));
+  schedulePrepare(0);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -275,7 +281,7 @@ export function schedulePrepare(delay = 350) {
       return;
     }
     try {
-      const prepared = await api.prepareImplement(s.root, s.spec, s.checked, s.implementProfile);
+      const prepared = await api.prepareImplement(s.root, s.spec, s.checked, s.fullContext, s.implementProfile);
       set({ prepared, specStatus: get().expandStatus === "running" ? "running" : prepared.spec.files.length ? "done" : "error" });
     } catch (e) {
       set({ prepared: null });
@@ -336,6 +342,7 @@ export async function implement(profileId?: string, specOverride?: string) {
       contextFiles: s.checked,
       mode: s.mode === "auto" ? null : s.mode,
       profileId: pid,
+      fullContext: s.fullContext,
     });
     const r = resp.result;
     const decisions: Record<string, "pending"> = {};
@@ -534,6 +541,7 @@ export async function loadJob(jobId: string) {
     spec: d.job.spec,
     specStatus: d.job.spec ? "done" : "idle",
     checked: d.job.contextFiles,
+    fullContext: [],
     expandStatus: d.job.spec ? "done" : "idle",
     expandInfo: d.job.claudeBackend ? `Spec by Claude (${d.job.claudeBackend})${d.job.specEdited ? ", edited" : ""}` : "",
     runs,

@@ -5,6 +5,7 @@ use crate::config::Profile;
 use crate::editformat::{BlockOutcome, ParseIssue, ProposedFile, Workspace, fenced_lang, parse_blocks, retry_message};
 use crate::events::{Sink, emit};
 use crate::llm::{ChatMessage, Delta, Endpoint, LiveStats, build_body, stream_chat};
+use crate::outline;
 use crate::pathsafe::normalize_rel;
 use crate::project::{ProjectSource, read_text};
 use crate::reasoning::strip_reasoning;
@@ -27,6 +28,41 @@ pub struct ImplementRequest {
     /// `None` → follow the budget recommendation.
     #[serde(default)]
     pub mode: Option<SplitMode>,
+    #[serde(default)]
+    pub context_options: ContextOptions,
+}
+
+/// Read-only context files at least this large may be sent as an outline; smaller ones go in
+/// full because an outline would save little.
+pub const OUTLINE_MIN_TOKENS: u32 = 600;
+/// An outline is only used if it is at most this fraction of the full file.
+pub const OUTLINE_MAX_RATIO: f64 = 0.8;
+
+/// How read-only context files are sent to the local model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ContextOptions {
+    /// Send large context files as outlines (signatures, declarations, docstrings; bodies omitted).
+    pub outlines: bool,
+    /// Context files to send in full even when outlines are on.
+    pub full: Vec<String>,
+}
+
+impl Default for ContextOptions {
+    fn default() -> Self {
+        Self {
+            outlines: true,
+            full: Vec::new(),
+        }
+    }
+}
+
+impl ContextOptions {
+    fn wants_full(&self, path: &str) -> bool {
+        self.full
+            .iter()
+            .any(|f| normalize_rel(f).is_ok_and(|n| n.eq_ignore_ascii_case(path)))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,8 +72,26 @@ pub struct PreparedFile {
     pub exists: bool,
     pub target: bool,
     pub action: Option<FileAction>,
+    /// Tokens sent to the model: the outline's size if `outline`, else the whole file's.
     pub tokens: u32,
+    /// Size of the whole file.
+    #[serde(default)]
+    pub full_tokens: u32,
+    /// Size of the outline, for context files where an outline is available and worthwhile.
+    #[serde(default)]
+    pub outline_tokens: Option<u32>,
+    /// True if this context file is sent as an outline.
+    #[serde(default)]
+    pub outline: bool,
     pub error: Option<String>,
+}
+
+/// A read-only context file as sent to the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextText {
+    pub path: String,
+    pub text: String,
+    pub outline: bool,
 }
 
 /// Everything known before the local model runs: parsed spec, files, and the budget plan.
@@ -48,6 +102,7 @@ pub struct Prepared {
     pub files: Vec<PreparedFile>,
     pub budget: BudgetPlan,
     pub warnings: Vec<String>,
+    /// Text sent to the model per file: targets in full, context files in full or as an outline.
     #[serde(skip)]
     contents: Vec<(String, Option<String>)>,
 }
@@ -127,8 +182,16 @@ pub fn lang_for(path: &str) -> &'static str {
     }
 }
 
-/// Parse the spec, read the target and context files (safely), and compute the budget plan.
-pub fn prepare(root: &Path, spec_text: &str, context_files: &[String], profile: &Profile, system_prompt: &str) -> Prepared {
+/// Parse the spec, read the target and context files (safely), outline large context files,
+/// and compute the budget plan.
+pub fn prepare(
+    root: &Path,
+    spec_text: &str,
+    context_files: &[String],
+    opts: &ContextOptions,
+    profile: &Profile,
+    system_prompt: &str,
+) -> Prepared {
     let spec = parse_spec(spec_text);
     let mut warnings = spec.warnings.clone();
     let mut files: Vec<PreparedFile> = Vec::new();
@@ -153,16 +216,30 @@ pub fn prepare(root: &Path, spec_text: &str, context_files: &[String], profile: 
                 if !target && !exists {
                     return; // mentioned path that doesn't exist — not useful as context
                 }
-                let tokens = content.as_deref().map(estimate_tokens).unwrap_or(0);
+                let full_tokens = content.as_deref().map(estimate_tokens).unwrap_or(0);
+                let outlined = match content.as_deref() {
+                    Some(text) if !target && full_tokens >= OUTLINE_MIN_TOKENS => outline::outline(&p, text)
+                        .map(|o| (estimate_tokens(&o.text), o.text))
+                        .filter(|(t, _)| f64::from(*t) <= f64::from(full_tokens) * OUTLINE_MAX_RATIO),
+                    _ => None,
+                };
+                let outline_tokens = outlined.as_ref().map(|(t, _)| *t);
+                let (sent, tokens, outline) = match outlined {
+                    Some((t, text)) if opts.outlines && !opts.wants_full(&p) => (Some(text), t, true),
+                    _ => (content, full_tokens, false),
+                };
                 files.push(PreparedFile {
                     path: p.clone(),
                     exists,
                     target,
                     action,
                     tokens,
+                    full_tokens,
+                    outline_tokens,
+                    outline,
                     error: None,
                 });
-                contents.push((p, content));
+                contents.push((p, sent));
             }
             Err(e) => {
                 warnings.push(format!("Cannot read `{p}`: {e}"));
@@ -172,6 +249,9 @@ pub fn prepare(root: &Path, spec_text: &str, context_files: &[String], profile: 
                     target,
                     action,
                     tokens: 0,
+                    full_tokens: 0,
+                    outline_tokens: None,
+                    outline: false,
                     error: Some(e.to_string()),
                 });
             }
@@ -232,8 +312,11 @@ fn content_of<'a>(prep: &'a Prepared, path: &str) -> Option<&'a Option<String>> 
     prep.contents.iter().find(|(p, _)| p.eq_ignore_ascii_case(path)).map(|(_, c)| c)
 }
 
+pub const OUTLINE_NOTE: &str = "Files marked (outline) show only declarations, signatures, doc comments and docstrings. \
+Each `… (N lines omitted)` line stands for code that exists in the real file but is not shown.";
+
 /// The user message for one local-model call.
-pub fn build_user_message(spec_text: &str, targets: &[(String, Option<String>)], context: &[(String, String)]) -> String {
+pub fn build_user_message(spec_text: &str, targets: &[(String, Option<String>)], context: &[ContextText]) -> String {
     let mut m = String::from("# Specification\n\n");
     m.push_str(spec_text.trim());
     m.push_str("\n\n# Files to edit\n");
@@ -249,8 +332,13 @@ pub fn build_user_message(spec_text: &str, targets: &[(String, Option<String>)],
     }
     if !context.is_empty() {
         m.push_str("\n# Read-only context (do NOT edit these files)\n");
-        for (path, c) in context {
-            m.push_str(&format!("\n## `{path}`\n{}\n", fenced_lang(c, lang_for(path))));
+        if context.iter().any(|c| c.outline) {
+            m.push_str(OUTLINE_NOTE);
+            m.push('\n');
+        }
+        for c in context {
+            let label = if c.outline { " (outline)" } else { "" };
+            m.push_str(&format!("\n## `{}`{label}\n{}\n", c.path, fenced_lang(&c.text, lang_for(&c.path))));
         }
     }
     m.push_str("\nNow output the SEARCH/REPLACE blocks that implement the specification.");
@@ -261,16 +349,24 @@ struct CallPlan {
     target: Option<String>,
     spec_text: String,
     targets: Vec<(String, Option<String>)>,
-    context: Vec<(String, String)>,
+    context: Vec<ContextText>,
     allowed: Option<Vec<String>>,
 }
 
 fn plan_calls(prep: &Prepared, spec_text: &str, mode: SplitMode) -> Vec<CallPlan> {
     let target_files: Vec<&PreparedFile> = prep.files.iter().filter(|f| f.target && f.error.is_none()).collect();
-    let ctx_of = |names: &[String]| -> Vec<(String, String)> {
+    let ctx_of = |names: &[String]| -> Vec<ContextText> {
         names
             .iter()
-            .filter_map(|n| content_of(prep, n).and_then(|c| c.clone()).map(|c| (n.clone(), c)))
+            .filter_map(|n| {
+                let text = content_of(prep, n).and_then(|c| c.clone())?;
+                let outline = prep.files.iter().any(|f| f.outline && f.path.eq_ignore_ascii_case(n));
+                Some(ContextText {
+                    path: n.clone(),
+                    text,
+                    outline,
+                })
+            })
             .collect()
     };
     match mode {
@@ -331,7 +427,14 @@ fn ev(sink: &Sink, run_id: &str, kind: &str, extra: serde_json::Value) {
 pub async fn implement(ctx: &RunContext<'_>, req: &ImplementRequest) -> ImplementResult {
     let started = Instant::now();
     let root = PathBuf::from(&req.project_root);
-    let prep = prepare(&root, &req.spec, &req.context_files, ctx.profile, &ctx.system_prompt);
+    let prep = prepare(
+        &root,
+        &req.spec,
+        &req.context_files,
+        &req.context_options,
+        ctx.profile,
+        &ctx.system_prompt,
+    );
     let mode = req.mode.unwrap_or(prep.budget.recommended);
     let mut result = ImplementResult {
         run_id: req.run_id.clone(),
@@ -659,16 +762,25 @@ mod tests {
         d
     }
 
+    fn prep(d: &tempfile::TempDir, context: &[String], opts: &ContextOptions) -> Prepared {
+        prepare(d.path(), SPEC, context, opts, &builtin_profiles()[0], "sys")
+    }
+
+    /// A Python module of `n` helpers, each with a 4-line body after its docstring.
+    fn big_py(n: usize) -> String {
+        let mut s = String::from("import os\n\n");
+        for i in 0..n {
+            s.push_str(&format!(
+                "def helper_{i}(value: int) -> int:\n    \"\"\"Helper {i}.\"\"\"\n    total = value + {i}\n    total *= 2\n    total -= 1\n    return total\n\n\n"
+            ));
+        }
+        s
+    }
+
     #[test]
     fn prepare_collects_targets_context_and_mentions() {
         let d = project();
-        let p = prepare(
-            d.path(),
-            SPEC,
-            &["notes.md".into(), "../evil".into()],
-            &builtin_profiles()[0],
-            "sys",
-        );
+        let p = prep(&d, &["notes.md".into(), "../evil".into()], &ContextOptions::default());
         let names: Vec<(&str, bool, bool)> = p.files.iter().map(|f| (f.path.as_str(), f.target, f.exists)).collect();
         assert_eq!(
             names,
@@ -688,17 +800,89 @@ mod tests {
         let m = build_user_message(
             "SPEC",
             &[("a.py".into(), Some("x = 1\n".into())), ("b.py".into(), None)],
-            &[("u.py".into(), "y".into())],
+            &[ContextText {
+                path: "u.py".into(),
+                text: "y".into(),
+                outline: false,
+            }],
         );
         assert!(m.contains("## `a.py`\n```python\nx = 1\n```"));
         assert!(m.contains("New file"));
         assert!(m.contains("Read-only context"));
+        assert!(m.contains("## `u.py`\n```python\ny\n```"));
+        assert!(!m.contains(OUTLINE_NOTE), "no outline note without outlines");
+    }
+
+    #[test]
+    fn large_context_files_are_outlined_unless_sent_in_full() {
+        let d = project();
+        // util.py is mentioned by SPEC, so it is auto-included as read-only context.
+        std::fs::write(d.path().join("util.py"), big_py(40)).unwrap();
+        let p = prep(&d, &[], &ContextOptions::default());
+        let u = p.files.iter().find(|f| f.path == "util.py").unwrap();
+        assert!(u.outline && !u.target);
+        assert_eq!(u.outline_tokens, Some(u.tokens));
+        assert!(u.tokens * 4 < u.full_tokens * 3, "outline {} vs full {}", u.tokens, u.full_tokens);
+
+        let calls = plan_calls(&p, SPEC, SplitMode::Single);
+        let c = calls[0].context.iter().find(|c| c.path == "util.py").unwrap();
+        assert!(c.outline);
+        assert!(
+            c.text.contains("def helper_3(value: int) -> int:\n    \"\"\"Helper 3.\"\"\"\n    # … (4 lines omitted)\n"),
+            "{}",
+            c.text
+        );
+        let msg = build_user_message(SPEC, &calls[0].targets, &calls[0].context);
+        assert!(msg.contains("## `util.py` (outline)\n```python\nimport os"));
+        assert!(msg.contains(OUTLINE_NOTE));
+
+        // Asking for the whole file (any spelling of the path) or switching outlines off sends it in
+        // full; the budget then counts the whole file.
+        for opts in [
+            ContextOptions {
+                outlines: true,
+                full: vec!["./UTIL.py".into()],
+            },
+            ContextOptions {
+                outlines: false,
+                full: vec![],
+            },
+        ] {
+            let pf = prep(&d, &[], &opts);
+            let uf = pf.files.iter().find(|f| f.path == "util.py").unwrap();
+            assert!(!uf.outline && uf.tokens == uf.full_tokens, "{opts:?}");
+            assert_eq!(uf.outline_tokens, u.outline_tokens, "the outline size is still reported");
+            assert_eq!(
+                pf.budget.single.input_tokens - p.budget.single.input_tokens,
+                u.full_tokens - u.tokens
+            );
+            let calls = plan_calls(&pf, SPEC, SplitMode::Single);
+            let c = calls[0].context.iter().find(|c| c.path == "util.py").unwrap();
+            assert!(!c.outline && c.text.contains("    total -= 1\n"));
+        }
+    }
+
+    #[test]
+    fn targets_and_small_or_unsupported_context_files_are_sent_in_full() {
+        let d = project();
+        std::fs::write(d.path().join("a.py"), big_py(40)).unwrap();
+        std::fs::write(d.path().join("notes.md"), "line of notes\n".repeat(400)).unwrap();
+        let p = prep(&d, &["notes.md".into()], &ContextOptions::default());
+        for f in &p.files {
+            assert!(!f.outline && f.tokens == f.full_tokens, "{f:?}");
+        }
+        let a = p.files.iter().find(|f| f.path == "a.py").unwrap();
+        assert!(a.target && a.outline_tokens.is_none() && a.tokens > OUTLINE_MIN_TOKENS);
+        let u = p.files.iter().find(|f| f.path == "util.py").unwrap();
+        assert!(u.tokens < OUTLINE_MIN_TOKENS && u.outline_tokens.is_none());
+        let n = p.files.iter().find(|f| f.path == "notes.md").unwrap();
+        assert!(n.tokens > OUTLINE_MIN_TOKENS && n.outline_tokens.is_none(), "markdown has no outline");
     }
 
     #[test]
     fn per_file_plan_restricts_allowed_paths() {
         let d = project();
-        let p = prepare(d.path(), SPEC, &[], &builtin_profiles()[0], "sys");
+        let p = prep(&d, &[], &ContextOptions::default());
         let calls = plan_calls(&p, SPEC, SplitMode::PerFile);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].allowed.as_deref(), Some(&["a.py".to_string()][..]));

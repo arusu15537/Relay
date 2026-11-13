@@ -146,8 +146,16 @@ pub fn parse_spec_cmd(spec: String) -> ParsedSpec {
 }
 
 #[tauri::command]
-pub fn prepare_implement(core: Core<'_>, root: String, spec: String, context_files: Vec<String>, profile_id: String) -> R<Prepared> {
-    core.prepare(&root, &spec, &context_files, &profile_id).map_err(e)
+pub fn prepare_implement(
+    core: Core<'_>,
+    root: String,
+    spec: String,
+    context_files: Vec<String>,
+    full_context: Option<Vec<String>>,
+    profile_id: String,
+) -> R<Prepared> {
+    core.prepare(&root, &spec, &context_files, &full_context.unwrap_or_default(), &profile_id)
+        .map_err(e)
 }
 
 #[tauri::command]

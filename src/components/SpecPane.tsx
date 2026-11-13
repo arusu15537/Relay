@@ -1,5 +1,5 @@
 import Editor from "@monaco-editor/react";
-import { cancelRun, implement, schedulePrepare, setSpec } from "../actions";
+import { cancelRun, implement, schedulePrepare, setSpec, toggleFullContext } from "../actions";
 import { fmtCtx, fmtTokens } from "../api";
 import { set, useStore } from "../store";
 import type { Prepared } from "../types";
@@ -93,6 +93,7 @@ export function SpecPane() {
   const implementProfile = useStore((s) => s.implementProfile);
   const runningRun = useStore((s) => s.runs.find((r) => r.status === "running"));
   const root = useStore((s) => s.root);
+  const outlinesOn = useStore((s) => s.settings?.outlineContext ?? true);
   const streaming = expandStatus === "running";
 
   const checkedSet = new Set(useStore.getState().checked);
@@ -146,16 +147,32 @@ export function SpecPane() {
             <div className="col">
               <span className="section-label">Files for the local model</span>
               <div className="chips">
-                {prepared.files.map((f) => (
-                  <span
-                    key={f.path}
-                    className={`chip ${f.error ? "err" : f.target ? (f.exists ? "target" : "new") : "ctx"}`}
-                    title={f.error ?? (f.target ? (f.exists ? "Will be edited" : "Will be created") : checkedSet.has(f.path) ? "Ticked as context" : "Mentioned in the spec → auto-included as context")}
-                  >
-                    {f.target ? (f.exists ? "✎" : "+") : "◦"} {f.path}
-                    {f.tokens > 0 && <span className="faint">{fmtTokens(f.tokens)}</span>}
-                  </span>
-                ))}
+                {prepared.files.map((f) => {
+                  const cls = `chip ${f.error ? "err" : f.target ? (f.exists ? "target" : "new") : "ctx"}`;
+                  const why = f.error ?? (f.target ? (f.exists ? "Will be edited" : "Will be created") : checkedSet.has(f.path) ? "Ticked as context" : "Mentioned in the spec → auto-included as context");
+                  const body = (
+                    <>
+                      {f.target ? (f.exists ? "✎" : "+") : "◦"} {f.path}
+                      {f.outline && <span className="tag">outline</span>}
+                      {f.tokens > 0 && <span className="faint">{fmtTokens(f.tokens)}</span>}
+                    </>
+                  );
+                  if (!outlinesOn || f.target || f.outlineTokens == null) {
+                    return (
+                      <span key={f.path} className={cls} title={why}>
+                        {body}
+                      </span>
+                    );
+                  }
+                  const title = f.outline
+                    ? `${why}. Sent as an outline (declarations, signatures and docstrings; bodies omitted): ≈${fmtTokens(f.tokens)} of ≈${fmtTokens(f.fullTokens)} tokens. Click to send the whole file.`
+                    : `${why}. Sent in full (≈${fmtTokens(f.fullTokens)} tokens). Click to send an outline instead (≈${fmtTokens(f.outlineTokens)} tokens).`;
+                  return (
+                    <button key={f.path} className={cls} title={title} aria-pressed={!f.outline} onClick={() => toggleFullContext(f.path)}>
+                      {body}
+                    </button>
+                  );
+                })}
                 {prepared.files.length === 0 && <span className="faint">No files found in the spec's Files section.</span>}
               </div>
             </div>

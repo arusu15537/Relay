@@ -44,6 +44,8 @@ pub struct Settings {
     pub review_enabled: bool,
     pub auto_fallback: bool,
     pub fallback_profile: String,
+    /// Send large read-only context files to the local model as outlines (bodies omitted).
+    pub outline_context: bool,
     pub last_project: String,
     pub load_timeout_secs: u64,
     /// Measured load times per profile id (seconds), used for the load-progress estimate.
@@ -64,6 +66,7 @@ impl Default for Settings {
             review_enabled: false,
             auto_fallback: false,
             fallback_profile: "gpt-oss-20b".into(),
+            outline_context: true,
             last_project: String::new(),
             load_timeout_secs: 600,
             load_stats: Default::default(),

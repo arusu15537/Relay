@@ -103,6 +103,7 @@ Sampling defaults: Qwen non-thinking mode `temperature 0.7, top_p 0.8, top_k 20,
 * **Toolbar:** project folder (+ git branch/dirty state), **model switcher** (unloaded / loading with progress / ready / error), VRAM in use, History, Log, Settings. Switching unloads the current model, waits for the process to exit, then loads the new one. Only one model is in memory at a time.
 * **① Instruction:** type the instruction, tick files to give Claude as context (`Ctrl+Enter` expands). With the CLI backend, Claude may also read the project with read-only tools (Read/Glob/Grep) — toggle in Settings → Claude.
 * **② Spec:** Claude's output streams in, then becomes an editable Markdown editor. Relay parses the `## Files` list: ✎ = will be edited, + = will be created, ◦ = read-only context (ticked files and any file the spec mentions are auto-included). The **context budget** shows estimated prompt tokens + reserved output against the selected profile's context; if the job doesn't fit, Relay warns and defaults to **one call per file** (each call gets the Summary, that file's `### path` section, Edge cases, Acceptance criteria and that file). You can force single/per-file mode.
+  * **Context outlines:** large read-only context files (≥ 600 estimated tokens, in Python, JavaScript, TypeScript/TSX, Rust, Go, Java, C#, C or C++) are sent to the local model as an *outline*: the file with function and method bodies (and the inside of long string/array/dict literals) replaced by `… (N lines omitted)` markers, so imports, declarations, signatures, doc comments and docstrings remain, verbatim. On Relay's own sources that is 20–30% of the tokens. Their chips show an *outline* tag; click one to send that file in full for this session. Files being edited are always sent in full. Switch it off in Settings → *Context outlines*. To see what a file's outline looks like: `cargo run --example outline -- path	oile.py`.
 * **③ Result:** live output with tokens/sec, then per-file side-by-side diffs (Monaco). The right side is editable before you accept. **Accept / Reject** per file or **Accept all**. If the project is a git repo with uncommitted changes, Relay warns before the first write and offers a **checkpoint commit**. Files changed on disk since the run read them are not overwritten without asking.
   * **Re-run with another model** sends the same spec to a different profile (switching models as needed); **Compare with** shows the two models' proposals diffed against each other, with speed/time/attempt stats.
   * **Review applied diff with Claude** (or automatically, if enabled) returns PASS / NEEDS_FIXES plus an optional follow-up spec you can load with one click.
@@ -187,13 +188,13 @@ npm run tauri build        :: release build + NSIS installer
 
 ```bat
 cd src-tauri
-cargo test --lib                     :: 84 unit tests
+cargo test --lib                     :: unit tests
 cargo run --example e2e -- fake      :: backend end-to-end against a fake llama-server (no GPU)
 cargo run --example e2e -- claude    :: + real Claude CLI expansion and review
 cargo run --example e2e -- real      :: real llama-server + the three real models (uses the GPU!)
 ```
 
-Unit tests cover the SEARCH/REPLACE parser and applier, context budgeting, path safety (including junction escapes), per-profile reasoning suppression and stripping, spec parsing, prompt templates, SSE parsing, server arguments and error diagnosis, history, and resumable/verified downloads.
+Unit tests cover the SEARCH/REPLACE parser and applier, context budgeting, context outlines (all nine grammars), path safety (including junction escapes), per-profile reasoning suppression and stripping, spec parsing, prompt templates, SSE parsing, server arguments and error diagnosis, history, and resumable/verified downloads.
 
 `tools/fake-llama-server` is a GPU-free stand-in for llama-server (same CLI flags, log lines, `/health`, `/tokenize`, streaming `/v1/chat/completions` with timings). It can be scripted (`FAKE_LLM_SCRIPT=rules.json`) or synthesizes valid edits for any spec; `--fake-fail`, `--fake-reasoning`, `--fake-tps N`, `--fake-load-ms N` simulate failures, gpt-oss-style reasoning and speed.
 
@@ -224,6 +225,7 @@ src-tauri/src/
   pathsafe.rs             project-folder confinement
   reasoning.rs            per-profile reasoning suppression + stripping
   budget.rs               token estimates, single vs per-file plans
+  outline.rs              tree-sitter outlines of read-only context files
   spec.rs                 spec Markdown parsing, per-file specs
   pipeline.rs             implement step (prompting, streaming, validation, retry)
   server.rs, winproc.rs   llama-server lifecycle, job objects, orphan cleanup

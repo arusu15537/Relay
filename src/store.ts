@@ -60,6 +60,8 @@ export interface Store {
   files: T.FileEntry[];
   filesTruncated: boolean;
   checked: string[];
+  /** Context files to send in full instead of as an outline (this session only). */
+  fullContext: string[];
   git: T.GitStatus | null;
 
   jobId: string;
@@ -101,6 +103,7 @@ export const useStore = create<Store>(() => ({
   files: [],
   filesTruncated: false,
   checked: [],
+  fullContext: [],
   git: null,
   jobId: crypto.randomUUID(),
   instruction: "",
