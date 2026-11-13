@@ -52,6 +52,9 @@ pub struct ChatOutcome {
     pub finish_reason: Option<String>,
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
+    /// Prompt tokens the server reused from its prompt cache instead of processing them again
+    /// (llama-server `timings.cache_n`, or OpenAI-style `usage.prompt_tokens_details.cached_tokens`).
+    pub cached_tokens: Option<u32>,
     /// Generation speed: server-reported (llama-server `timings`) when available, else measured.
     pub tok_per_sec: Option<f64>,
     pub tok_per_sec_source: String,
@@ -154,6 +157,29 @@ fn friendly_error(status: u16, body: &str) -> String {
     format!("HTTP {status}: {msg}")
 }
 
+/// Token usage, prompt-cache reuse and llama-server timings from one stream chunk. Chunks
+/// without them (or with `"usage": null`, as OpenAI sends mid-stream) change nothing.
+fn read_stats(v: &Value, out: &mut ChatOutcome) {
+    let num = |x: Option<&Value>| x.and_then(|n| n.as_u64()).map(|n| n as u32);
+    if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+        out.prompt_tokens = num(u.get("prompt_tokens")).or(out.prompt_tokens);
+        out.completion_tokens = num(u.get("completion_tokens")).or(out.completion_tokens);
+        if let Some(c) = num(u.pointer("/prompt_tokens_details/cached_tokens")) {
+            out.cached_tokens = Some(c);
+        }
+    }
+    if let Some(t) = v.get("timings").filter(|t| t.is_object()) {
+        if let Some(tps) = t.get("predicted_per_second").and_then(|n| n.as_f64()) {
+            out.tok_per_sec = Some(tps);
+            out.tok_per_sec_source = "server".into();
+        }
+        out.prompt_per_sec = t.get("prompt_per_second").and_then(|n| n.as_f64()).or(out.prompt_per_sec);
+        if let Some(c) = num(t.get("cache_n")) {
+            out.cached_tokens = Some(c);
+        }
+    }
+}
+
 /// Stream a chat completion. `on_delta` receives every content/reasoning piece plus live stats.
 pub async fn stream_chat(
     http: &reqwest::Client,
@@ -233,17 +259,7 @@ pub async fn stream_chat(
                 }
             }
         }
-        if let Some(u) = v.get("usage") {
-            out.prompt_tokens = u.get("prompt_tokens").and_then(|n| n.as_u64()).map(|n| n as u32);
-            out.completion_tokens = u.get("completion_tokens").and_then(|n| n.as_u64()).map(|n| n as u32);
-        }
-        if let Some(t) = v.get("timings") {
-            if let Some(tps) = t.get("predicted_per_second").and_then(|n| n.as_f64()) {
-                out.tok_per_sec = Some(tps);
-                out.tok_per_sec_source = "server".into();
-            }
-            out.prompt_per_sec = t.get("prompt_per_second").and_then(|n| n.as_f64());
-        }
+        read_stats(&v, out);
         Ok(false)
     };
 
@@ -320,6 +336,36 @@ mod tests {
         assert_eq!(g["reasoning_effort"], json!("low"));
         assert!(g.get("top_k").is_none(), "top_k 0 means disabled and is omitted");
         assert_eq!(g["model"], json!("gpt-oss:20b"));
+    }
+
+    #[test]
+    fn stats_include_prompt_cache_reuse() {
+        let mut o = ChatOutcome::default();
+        // OpenAI-style mid-stream chunk: usage is null.
+        read_stats(&json!({"choices": [], "usage": null}), &mut o);
+        assert_eq!((o.prompt_tokens, o.cached_tokens), (None, None));
+        // llama-server final chunk.
+        read_stats(
+            &json!({"usage": {"prompt_tokens": 5000, "completion_tokens": 300},
+                    "timings": {"cache_n": 4200, "prompt_n": 800, "predicted_per_second": 48.5, "prompt_per_second": 1900.0}}),
+            &mut o,
+        );
+        assert_eq!((o.prompt_tokens, o.completion_tokens, o.cached_tokens), (Some(5000), Some(300), Some(4200)));
+        assert_eq!(o.tok_per_sec, Some(48.5));
+        assert_eq!(o.tok_per_sec_source, "server");
+
+        // OpenAI-compatible servers that report cached tokens in usage instead.
+        let mut o = ChatOutcome::default();
+        read_stats(
+            &json!({"usage": {"prompt_tokens": 900, "completion_tokens": 10, "prompt_tokens_details": {"cached_tokens": 512}}}),
+            &mut o,
+        );
+        assert_eq!(o.cached_tokens, Some(512));
+
+        // A server without cache information leaves it unknown.
+        let mut o = ChatOutcome::default();
+        read_stats(&json!({"usage": {"prompt_tokens": 900, "completion_tokens": 10}}), &mut o);
+        assert_eq!(o.cached_tokens, None);
     }
 
     #[test]

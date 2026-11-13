@@ -212,6 +212,8 @@ export interface AttemptReport {
   ok: boolean;
   tokPerSec: number | null;
   promptTokens: number | null;
+  /** Prompt tokens the server reused from its prompt cache (missing in older history entries). */
+  cachedTokens?: number | null;
   completionTokens: number | null;
   durationMs: number;
   finishReason: string | null;

@@ -120,6 +120,9 @@ pub struct AttemptReport {
     pub ok: bool,
     pub tok_per_sec: Option<f64>,
     pub prompt_tokens: Option<u32>,
+    /// Prompt tokens reused from the server's prompt cache (not processed again).
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub duration_ms: u64,
     pub finish_reason: Option<String>,
@@ -316,10 +319,26 @@ pub const OUTLINE_NOTE: &str = "Files marked (outline) show only declarations, s
 Each `… (N lines omitted)` line stands for code that exists in the real file but is not shown.";
 
 /// The user message for one local-model call.
+///
+/// The parts that change least come first, because llama-server reuses the KV cache for the
+/// longest prefix a prompt shares with the previous one and only processes the rest:
+/// read-only context (shared by all calls of a per-file run), then the files to edit (the same
+/// when only the spec is edited and the job re-run), then the spec, which changes most.
 pub fn build_user_message(spec_text: &str, targets: &[(String, Option<String>)], context: &[ContextText]) -> String {
-    let mut m = String::from("# Specification\n\n");
-    m.push_str(spec_text.trim());
-    m.push_str("\n\n# Files to edit\n");
+    let mut m = String::new();
+    if !context.is_empty() {
+        m.push_str("# Read-only context (do NOT edit these files)\n");
+        if context.iter().any(|c| c.outline) {
+            m.push_str(OUTLINE_NOTE);
+            m.push('\n');
+        }
+        for c in context {
+            let label = if c.outline { " (outline)" } else { "" };
+            m.push_str(&format!("\n## `{}`{label}\n{}\n", c.path, fenced_lang(&c.text, lang_for(&c.path))));
+        }
+        m.push('\n');
+    }
+    m.push_str("# Files to edit\n");
     for (path, content) in targets {
         match content {
             Some(c) => {
@@ -330,18 +349,9 @@ pub fn build_user_message(spec_text: &str, targets: &[(String, Option<String>)],
             )),
         }
     }
-    if !context.is_empty() {
-        m.push_str("\n# Read-only context (do NOT edit these files)\n");
-        if context.iter().any(|c| c.outline) {
-            m.push_str(OUTLINE_NOTE);
-            m.push('\n');
-        }
-        for c in context {
-            let label = if c.outline { " (outline)" } else { "" };
-            m.push_str(&format!("\n## `{}`{label}\n{}\n", c.path, fenced_lang(&c.text, lang_for(&c.path))));
-        }
-    }
-    m.push_str("\nNow output the SEARCH/REPLACE blocks that implement the specification.");
+    m.push_str("\n# Specification\n\n");
+    m.push_str(spec_text.trim());
+    m.push_str("\n\nNow output the SEARCH/REPLACE blocks that implement the specification.");
     m
 }
 
@@ -705,6 +715,7 @@ async fn run_call(
             ok,
             tok_per_sec: outcome.tok_per_sec,
             prompt_tokens: outcome.prompt_tokens,
+            cached_tokens: outcome.cached_tokens,
             completion_tokens: outcome.completion_tokens,
             duration_ms: outcome.duration_ms,
             finish_reason: outcome.finish_reason.clone(),
@@ -715,7 +726,8 @@ async fn run_call(
             &req.run_id,
             "callEnd",
             json!({ "call": index, "attempt": attempt, "ok": ok, "blocks": parsed.blocks.len(), "failed": outcomes.iter().filter(|o| !o.ok).count(),
-                    "issues": issues.len(), "missing": missing, "tokPerSec": outcome.tok_per_sec, "completionTokens": outcome.completion_tokens }),
+                    "issues": issues.len(), "missing": missing, "tokPerSec": outcome.tok_per_sec, "completionTokens": outcome.completion_tokens,
+                    "promptTokens": outcome.prompt_tokens, "cachedTokens": outcome.cached_tokens }),
         );
         report.attempts.push(att);
         if ok {
@@ -811,6 +823,63 @@ mod tests {
         assert!(m.contains("Read-only context"));
         assert!(m.contains("## `u.py`\n```python\ny\n```"));
         assert!(!m.contains(OUTLINE_NOTE), "no outline note without outlines");
+    }
+
+    fn common_prefix(a: &str, b: &str) -> usize {
+        a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
+    }
+
+    #[test]
+    fn message_puts_context_then_files_then_spec() {
+        let m = build_user_message(
+            "SPEC TEXT",
+            &[("a.py".into(), Some("x = 1\n".into()))],
+            &[ContextText {
+                path: "u.py".into(),
+                text: "y".into(),
+                outline: false,
+            }],
+        );
+        let ctx = m.find("# Read-only context").unwrap();
+        let files = m.find("# Files to edit").unwrap();
+        let spec = m.find("# Specification\n\nSPEC TEXT").unwrap();
+        assert!(ctx == 0 && ctx < files && files < spec, "{m}");
+        assert!(m.ends_with("Now output the SEARCH/REPLACE blocks that implement the specification."));
+        // Without context the message starts with the files.
+        let m = build_user_message("S", &[("a.py".into(), None)], &[]);
+        assert!(m.starts_with("# Files to edit\n"), "{m}");
+    }
+
+    #[test]
+    fn per_file_calls_share_the_context_as_a_cacheable_prefix() {
+        let d = project();
+        std::fs::write(d.path().join("util.py"), big_py(40)).unwrap();
+        std::fs::write(d.path().join("notes.md"), "notes\n".repeat(50)).unwrap();
+        let p = prep(&d, &["notes.md".into()], &ContextOptions::default());
+        let calls = plan_calls(&p, SPEC, SplitMode::PerFile);
+        assert_eq!(calls.len(), 2);
+        let msgs: Vec<String> = calls
+            .iter()
+            .map(|c| build_user_message(&c.spec_text, &c.targets, &c.context))
+            .collect();
+        let files_at = msgs[0].find("# Files to edit").unwrap();
+        let shared = &msgs[0][..files_at];
+        assert!(shared.contains("## `util.py` (outline)") && shared.contains("## `notes.md`"), "{shared}");
+        assert!(
+            common_prefix(&msgs[0], &msgs[1]) > files_at,
+            "the second call must reuse the whole context section"
+        );
+    }
+
+    #[test]
+    fn editing_the_spec_keeps_the_files_cacheable() {
+        let d = project();
+        let p = prep(&d, &[], &ContextOptions::default());
+        let calls = plan_calls(&p, SPEC, SplitMode::Single);
+        let before = build_user_message(SPEC, &calls[0].targets, &calls[0].context);
+        let edited = SPEC.replace("change a", "change a differently");
+        let after = build_user_message(&edited, &calls[0].targets, &calls[0].context);
+        assert!(common_prefix(&before, &after) > before.find("# Specification").unwrap());
     }
 
     #[test]

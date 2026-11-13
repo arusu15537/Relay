@@ -13,12 +13,16 @@
 //! occurs in the last user message wins. Otherwise a synthetic answer is produced: for every
 //! file under "# Files to edit" it emits a valid SEARCH/REPLACE block appending a marker comment
 //! (or creates new files), so any spec flows through Relay's pipeline.
+//!
+//! Prompt cache: like llama-server with one slot, the part of a prompt that matches the previous
+//! request (its prompt plus the generated answer) counts as cached: `timings.cache_n`, with
+//! `timings.prompt_n` the rest (estimated as bytes / 4).
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 struct Opts {
@@ -258,10 +262,14 @@ fn synthetic(prompt: &str) -> String {
         return "I could not find any files.".into();
     };
     let section = &prompt[files_start..];
-    let section = section
-        .split("\n# Read-only context")
-        .next()
-        .unwrap_or(section);
+    // The section ends at the next heading Relay writes (`# Specification`, `# Read-only context`);
+    // other `# ` lines are file content, e.g. Python comments.
+    let end = ["\n# Specification\n", "\n# Read-only context"]
+        .iter()
+        .filter_map(|h| section.find(h))
+        .min()
+        .unwrap_or(section.len());
+    let section = &section[..end];
     let mut rest = section;
     while let Some(h) = rest.find("\n## `") {
         let after = &rest[h + 5..];
@@ -306,7 +314,26 @@ fn sse(mut s: &TcpStream, v: &Value) -> std::io::Result<()> {
     s.flush()
 }
 
+/// The previous request's prompt and answer, as the single slot's KV cache would hold them.
+static SLOT: Mutex<String> = Mutex::new(String::new());
+
+fn render_prompt(body: &Value) -> String {
+    let mut s = String::new();
+    for m in body["messages"].as_array().into_iter().flatten() {
+        s.push_str(m["role"].as_str().unwrap_or(""));
+        s.push('\n');
+        s.push_str(m["content"].as_str().unwrap_or(""));
+        s.push('\n');
+    }
+    s
+}
+
 fn chat(stream: TcpStream, body: &Value, o: &Opts, start: Instant) -> std::io::Result<()> {
+    let prompt = render_prompt(body);
+    let cached_bytes = {
+        let slot = SLOT.lock().unwrap();
+        slot.bytes().zip(prompt.bytes()).take_while(|(a, b)| a == b).count()
+    };
     let user = last_user(body);
     let mut response = String::new();
     let mut reasoning = String::new();
@@ -369,11 +396,19 @@ fn chat(stream: TcpStream, body: &Value, o: &Opts, start: Instant) -> std::io::R
         s,
         &json!({"choices":[{"index":0,"finish_reason":finish,"delta":{}}]}),
     )?;
-    let prompt_n = body.to_string().len() / 4;
+    let total = prompt.len() / 4;
+    let cache_n = cached_bytes / 4;
+    let prompt_n = total - cache_n;
+    *SLOT.lock().unwrap() = format!("{prompt}assistant\n{response}\n");
+    log(
+        start,
+        "I",
+        &format!("slot update_slots: n_past = {cache_n} of {total} prompt tokens (fake prompt cache)"),
+    );
     sse(
         s,
-        &json!({"choices":[],"usage":{"completion_tokens":n,"prompt_tokens":prompt_n,"total_tokens":n as usize+prompt_n},
-        "timings":{"prompt_n":prompt_n,"prompt_ms":5.0,"predicted_n":n,"predicted_ms":ms,"predicted_per_second": (n as f64)/(ms/1000.0).max(0.001)}}),
+        &json!({"choices":[],"usage":{"completion_tokens":n,"prompt_tokens":total,"total_tokens":n as usize+total},
+        "timings":{"cache_n":cache_n,"prompt_n":prompt_n,"prompt_ms":5.0,"predicted_n":n,"predicted_ms":ms,"predicted_per_second": (n as f64)/(ms/1000.0).max(0.001)}}),
     )?;
     write!(s, "data: [DONE]\n\n")?;
     s.flush()?;
