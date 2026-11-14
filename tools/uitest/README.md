@@ -24,5 +24,5 @@ window can stay in the background (no screen capture, no mouse).
 
 For the fake scenarios, point `llamaServerPath` at `tools\fake-llama-server\target\release\fake-llama-server.exe`
 and give each profile a dummy `.gguf` file. Extra flags such as `--fake-tps 60 --fake-reasoning` go in the profile's
-launch arguments. `uitest-prewarm.mjs` also needs a custom profile with id `fake-recurrent` whose launch arguments include
+launch arguments; `uitest-fake.mjs` expects `--spec-type draft-mtp,ngram-mod` in the Qwen3.8 profile (as in the built-in default), which makes the fake report draft stats. `uitest-prewarm.mjs` also needs a custom profile with id `fake-recurrent` whose launch arguments include
 `--fake-recurrent`; it resets the demo project (`git reset --hard` to its first commit) before it runs.

@@ -1,4 +1,5 @@
 // UI scenario against the fake llama-server: spec → implement → diff → accept → switch → re-run → compare.
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import { connect } from "./cdplib.mjs";
 
@@ -20,6 +21,17 @@ try {
   Object.assign(c, c2);
   await c.wait("!!window.__relay && window.__relay.useStore.getState().ready", 20000, "app ready");
   check(true, "app booted, project restored from settings: " + (await c.state("s.root")));
+  // Start from the seeded project with nothing loaded and Qwen3.8 selected (an earlier run accepts
+  // edits into the project and ends on another profile).
+  const root = await c.state("s.root");
+  const first = execFileSync("git", ["-C", root, "rev-list", "--max-parents=0", "HEAD"]).toString().trim();
+  execFileSync("git", ["-C", root, "reset", "-q", "--hard", first]);
+  execFileSync("git", ["-C", root, "clean", "-fdq"]);
+  await c.ev("window.__relay.actions.stopServer()");
+  await c.wait("window.__relay.useStore.getState().server?.state !== 'ready'", 15000, "no model loaded");
+  await c.ev("window.__relay.actions.saveSettings({ activeProfile: 'qwen3.8-27b' })");
+  await c.ev("window.__relay.useStore.setState({ implementProfile: 'qwen3.8-27b' })"); // = the Spec pane's model select
+  await c.ev("window.__relay.actions.refreshFiles()");
 
   // Spec typed by hand (no Claude): use the actions hook (same as typing in Monaco).
   await c.ev(`window.__relay.actions.setSpec(${JSON.stringify(SPEC)})`);
@@ -46,6 +58,8 @@ try {
   await new Promise((r) => setTimeout(r, 300));
   const callsText = await c.ev("document.querySelector('details.calls')?.textContent || ''");
   check(/prompt \d+ \(\d+ from cache\)/.test(callsText), `model calls show prompt-cache reuse: "${callsText.match(/prompt \d+[^·]*/)?.[0]}"`);
+  // The Qwen3.8 profile drafts with MTP (`--spec-type`); the fake server reports 3/4 accepted.
+  check(/drafts 75% accepted/.test(callsText), `model calls show draft acceptance: "${callsText.match(/drafts[^·]*/)?.[0]}"`);
   await c.shot(`${OUT}/ui-4b-calls.png`);
   await c.ev("document.querySelector('details.calls')?.removeAttribute('open')");
 

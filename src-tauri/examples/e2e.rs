@@ -260,13 +260,23 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
 
     let prep = core.prepare(&root, RETRY_SPEC, &[], &[], "qwen3.8-27b").await.unwrap();
     c.check(prep.files.iter().filter(|f| f.target).count() == 2, "spec parsed: 2 target files");
-    // The fake server's /tokenize counts bytes / 4 (the estimate uses bytes / 3.3).
+    // The fake server's /tokenize counts bytes / 4; a real tokenizer lands somewhere around 4 bytes
+    // per token for code, never exactly on the bytes / 3.3 estimate.
     let client = prep.files.iter().find(|f| f.path == "src/http_client.py");
-    let client_bytes = std::fs::read_to_string(project.join("src/http_client.py")).unwrap().len();
+    let client_text = std::fs::read_to_string(project.join("src/http_client.py")).unwrap();
+    let client_bytes = client_text.len();
+    let estimate = relay_lib::budget::estimate_tokens(&client_text) as usize;
+    let plausible = |t: usize| {
+        if mode == "real" {
+            (client_bytes / 8..=client_bytes / 2).contains(&t) && t != estimate
+        } else {
+            t == client_bytes.div_ceil(4)
+        }
+    };
     c.check(
-        prep.budget.exact && client.is_some_and(|f| f.tokens as usize == client_bytes.div_ceil(4)),
+        prep.budget.exact && client.is_some_and(|f| plausible(f.tokens as usize)),
         format!(
-            "exact token counts from the server's /tokenize ({:?} tokens for {client_bytes} bytes, exact: {})",
+            "exact token counts from the server's /tokenize ({:?} tokens for {client_bytes} bytes, estimate {estimate}, exact: {})",
             client.map(|f| f.tokens),
             prep.budget.exact
         ),

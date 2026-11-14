@@ -24,6 +24,9 @@
 //! `--fake-recurrent` simulates a hybrid/recurrent (or sliding-window) model: the cache can only
 //! be reused in full when the new prompt extends everything cached; otherwise only up to a
 //! checkpoint, and a request leaves a checkpoint shortly before the end of its prompt.
+//!
+//! `--spec-type <any>` reports speculative-decoding stats (`timings.draft_n`, `draft_n_accepted`:
+//! one drafted token per generated token, three quarters of them accepted).
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -42,6 +45,7 @@ struct Opts {
     tps: f64,
     reasoning: bool,
     recurrent: bool,
+    spec: bool,
 }
 
 fn parse_args() -> Opts {
@@ -56,6 +60,7 @@ fn parse_args() -> Opts {
         tps: 400.0,
         reasoning: false,
         recurrent: false,
+        spec: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -89,6 +94,10 @@ fn parse_args() -> Opts {
             "--fake-fail" => o.fail = true,
             "--fake-reasoning" => o.reasoning = true,
             "--fake-recurrent" => o.recurrent = true,
+            "--spec-type" => {
+                o.spec = !next().is_empty() && next() != "none";
+                i += 1;
+            }
             _ => {}
         }
         i += 1;
@@ -498,10 +507,15 @@ fn chat(stream: TcpStream, body: &Value, o: &Opts, start: Instant) -> std::io::R
         "I",
         &format!("slot update_slots: n_past = {cache_n} of {total} prompt tokens (fake prompt cache)"),
     );
+    let mut timings = json!({"cache_n":cache_n,"prompt_n":prompt_n,"prompt_ms":5.0,"predicted_n":n,"predicted_ms":ms,"predicted_per_second": (n as f64)/(ms/1000.0).max(0.001)});
+    if o.spec {
+        timings["draft_n"] = json!(n);
+        timings["draft_n_accepted"] = json!(n * 3 / 4);
+    }
     sse(
         s,
         &json!({"choices":[],"usage":{"completion_tokens":n,"prompt_tokens":total,"total_tokens":n as usize+total},
-        "timings":{"cache_n":cache_n,"prompt_n":prompt_n,"prompt_ms":5.0,"predicted_n":n,"predicted_ms":ms,"predicted_per_second": (n as f64)/(ms/1000.0).max(0.001)}}),
+        "timings":timings}),
     )?;
     write!(s, "data: [DONE]\n\n")?;
     s.flush()?;

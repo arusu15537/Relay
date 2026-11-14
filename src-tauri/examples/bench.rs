@@ -1,7 +1,7 @@
 //! GPU benchmark of profile variants for the reference card (uses the real llama-server and the
 //! three real models — GPU!). For each variant it loads the model, measures VRAM, load time,
 //! prompt-processing speed on a long prompt, generation speed and validity on the e2e retry spec
-//! (twice), and prompt-cache reuse in a per-file run. Baseline variants also run the cache
+//! (twice), and prompt-cache reuse in a per-file run. The `default` variants (shipped profiles) also run the cache
 //! control (per-file calls without priming), a spec-review prewarm, and a two-slot parallel test.
 //!
 //!   cargo run --release --example bench                # all variants
@@ -41,37 +41,43 @@ struct Variant {
 }
 
 
+// Launch arguments the variants build on (the profile defaults before the 2026-11-14 tuning), so
+// the comparisons do not shift when the built-in defaults change.
+const Q38: &str = "-ngl all -fa on -ctk q8_0 -ctv q8_0";
+const Q36: &str = "-ngl all --n-cpu-moe 18 -fa on --load-mode none";
+const OSS: &str = "-ngl all -fa on";
+
 fn variants() -> Vec<Variant> {
-    let v = |name, base, extra| Variant {
+    let v = |name, base, args, extra| Variant {
         name,
         base,
-        args: None,
+        args,
         extra,
         ctx: None,
         temperature: None,
         baseline: false,
     };
     vec![
-        Variant { baseline: true, ..v("qwen3.8 baseline", "qwen3.8-27b", "") },
-        v("qwen3.8 mtp", "qwen3.8-27b", "--spec-type draft-mtp"),
-        v("qwen3.8 ngram-mod", "qwen3.8-27b", "--spec-type ngram-mod"),
-        v("qwen3.8 ngram-simple", "qwen3.8-27b", "--spec-type ngram-simple"),
-        v("qwen3.8 mtp+ngram-mod", "qwen3.8-27b", "--spec-type draft-mtp,ngram-mod"),
-        Variant { temperature: Some(0.3), ..v("qwen3.8 mtp temp0.3", "qwen3.8-27b", "--spec-type draft-mtp") },
-        Variant { baseline: true, ..v("qwen3.6 baseline", "qwen3.6-35b-a3b", "") },
-        v("qwen3.6 ub2048", "qwen3.6-35b-a3b", "-ub 2048 -b 2048"),
-        v("qwen3.6 ngram-mod", "qwen3.6-35b-a3b", "--spec-type ngram-mod"),
-        Variant {
-            args: Some("-ngl all --n-cpu-moe 16 -fa on --load-mode none -ctk q8_0 -ctv q8_0"),
-            ..v("qwen3.6 q8kv ncmoe16", "qwen3.6-35b-a3b", "")
-        },
-        Variant {
-            args: Some("-ngl all --n-cpu-moe 14 -fa on --load-mode none -ctk q8_0 -ctv q8_0"),
-            ..v("qwen3.6 q8kv ncmoe14", "qwen3.6-35b-a3b", "")
-        },
-        Variant { baseline: true, ..v("gpt-oss baseline", "gpt-oss-20b", "") },
-        v("gpt-oss ngram-mod", "gpt-oss-20b", "--spec-type ngram-mod"),
-        Variant { ctx: Some(131072), ..v("gpt-oss ctx128k", "gpt-oss-20b", "") },
+        // `default` = the shipped profile; these also run the cache control, prewarm and two-slot tests.
+        Variant { baseline: true, ..v("qwen3.8 default", "qwen3.8-27b", None, "") },
+        v("qwen3.8 plain", "qwen3.8-27b", Some(Q38), ""),
+        v("qwen3.8 mtp", "qwen3.8-27b", Some(Q38), "--spec-type draft-mtp"),
+        v("qwen3.8 ngram-mod", "qwen3.8-27b", Some(Q38), "--spec-type ngram-mod"),
+        v("qwen3.8 ngram-simple", "qwen3.8-27b", Some(Q38), "--spec-type ngram-simple"),
+        Variant { temperature: Some(0.3), ..v("qwen3.8 mtp temp0.3", "qwen3.8-27b", Some(Q38), "--spec-type draft-mtp") },
+        // Longer drafts: n-max 5 gained nothing on first runs; 7 spilled out of VRAM (38 tok/s).
+        v("qwen3.8 mtpn5", "qwen3.8-27b", Some(Q38), "--spec-type draft-mtp,ngram-mod --spec-draft-n-max 5"),
+        Variant { baseline: true, ..v("qwen3.6 default", "qwen3.6-35b-a3b", None, "") },
+        v("qwen3.6 plain", "qwen3.6-35b-a3b", Some(Q36), ""),
+        v("qwen3.6 ub2048", "qwen3.6-35b-a3b", Some(Q36), "-ub 2048 -b 2048"),
+        v("qwen3.6 ngram-mod", "qwen3.6-35b-a3b", Some(Q36), "--spec-type ngram-mod"),
+        v("qwen3.6 q8kv ncmoe16", "qwen3.6-35b-a3b", Some("-ngl all --n-cpu-moe 16 -fa on --load-mode none -ctk q8_0 -ctv q8_0"), ""),
+        v("qwen3.6 q8kv ncmoe14", "qwen3.6-35b-a3b", Some("-ngl all --n-cpu-moe 14 -fa on --load-mode none -ctk q8_0 -ctv q8_0"), ""),
+        v("qwen3.6 combo ncmoe16", "qwen3.6-35b-a3b", Some("-ngl all --n-cpu-moe 16 -fa on --load-mode none -ctk q8_0 -ctv q8_0 -ub 2048 -b 2048"), ""),
+        v("qwen3.6 combo ncmoe14", "qwen3.6-35b-a3b", Some("-ngl all --n-cpu-moe 14 -fa on --load-mode none -ctk q8_0 -ctv q8_0 -ub 2048 -b 2048"), ""),
+        Variant { baseline: true, ..v("gpt-oss default", "gpt-oss-20b", None, "") },
+        Variant { ctx: Some(65536), ..v("gpt-oss ctx64k", "gpt-oss-20b", Some(OSS), "") },
+        v("gpt-oss ngram-mod", "gpt-oss-20b", Some(OSS), "--spec-type ngram-mod"),
     ]
 }
 
@@ -329,7 +335,7 @@ async fn run(base: &Path, filters: &[String]) -> i32 {
             match parallel_test(&settings, p, &project).await {
                 Ok(line) => {
                     println!("\n== parallel {id}: {line}");
-                    if let Some(r) = reports.iter_mut().find(|r| r.name.starts_with(&id[..7]) && r.name.ends_with("baseline")) {
+                    if let Some(r) = reports.iter_mut().find(|r| r.name.starts_with(&id[..7]) && r.name.ends_with("default")) {
                         r.extra.push(format!("two slots (-np 2): {line}"));
                     }
                 }

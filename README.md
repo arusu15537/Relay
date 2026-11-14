@@ -37,13 +37,13 @@ On first start: Settings → General → set the **models folder** (default `%LO
 
 ## Models
 
-Relay ships three built-in profiles. All values below were verified on Hugging Face on 2026-11-13 and measured with llama.cpp b12360 with nothing else using the GPU (Windows desktop ≈0.6 GB VRAM).
+Relay ships three built-in profiles. All values below were verified on Hugging Face on 2026-11-13 and measured with llama.cpp b12360 on 2026-11-14 with nothing else using the GPU (Windows desktop ≈0.5 GB VRAM, included in the totals).
 
 | Profile | Role | Repo → file | Size | Context | VRAM (total) | Speed |
 |---|---|---|---|---|---|---|
-| **Qwen3.8-27B** (dense) | best quality, default | [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) → `Qwen3.8-27B-UD-IQ4_XS.gguf` | 14.35 GB | 32k | ≈15.5 GB | ≈49 tok/s |
-| **Qwen3.6-35B-A3B** (MoE) | fast, long context | [`ggml-org/Qwen3.6-35B-A3B-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF) → `Qwen3.6-35B-A3B-Q4_K_M.gguf` | 20.54 GB | 64k | ≈14.5 GB | ≈73 tok/s |
-| **gpt-oss-20b** | most reliable format-following, fallback | [`ggml-org/gpt-oss-20b-GGUF`](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) → `gpt-oss-20b-MXFP4.gguf` | 12.11 GB | 64k | ≈13.9 GB | ≈205 tok/s |
+| **Qwen3.8-27B** (dense) | best quality, default | [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) → `Qwen3.8-27B-UD-IQ4_XS.gguf` | 14.35 GB | 32k | ≈15.8 GB | ≈120 tok/s (MTP drafting) |
+| **Qwen3.6-35B-A3B** (MoE) | fast, long context | [`ggml-org/Qwen3.6-35B-A3B-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF) → `Qwen3.6-35B-A3B-Q4_K_M.gguf` | 20.54 GB | 64k | ≈15.0 GB | ≈86 tok/s |
+| **gpt-oss-20b** | most reliable format-following, fallback | [`ggml-org/gpt-oss-20b-GGUF`](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) → `gpt-oss-20b-MXFP4.gguf` | 12.11 GB | 128k | ≈14.9 GB | ≈207 tok/s |
 
 SHA256 (from the HF LFS metadata; Relay verifies downloads against these):
 
@@ -59,31 +59,55 @@ f4ffe03c9139e6a905a5d346f77d9fabdd179367c3280dfd005d1e75ca5ed8c8  Qwen3.6-35B-A3
 
 * **Qwen3.8-27B: unsloth `UD-IQ4_XS` (14.35 GB) instead of bartowski `IQ4_XS` (15.48 GB).** Qwen3.8-27B has 16 full-attention layers × 4 KV heads × 256 dims → 64 KiB/token of f16 KV cache = 2 GiB at 32k. bartowski's file plus that cache does not fit in 16 GB. The unsloth file with a **q8_0 KV cache** (1 GiB at 32k) does.
 * **Qwen3.6-35B-A3B: ggml-org `Q4_K_M` (20.54 GB)**, the smallest Q4_K_M (unsloth's UD-Q4_K_M is 22.13 GB). Its KV cache is tiny (10 full-attention layers × 2 KV heads → 20 KiB/token).
-* **gpt-oss-20b: 64k context** (native 131k). KV ≈24 KiB/token, so 64k costs ≈1.5 GiB.
+* **gpt-oss-20b: full 128k context** (native 131,072). KV ≈24 KiB/token, so 128k costs ≈3 GiB and still fits (≈14.9 GB total, ≈1.7 GB more than 64k, same speed).
 
 ### Recommended llama-server flags (16 GB card)
 
 Relay starts the server itself; these are the profile defaults. Relay always appends `-m <gguf> --host 127.0.0.1 --port <port> -c <context limit> -np 1 --log-colors off` (`-np 1` matters: the default "auto" splits the context across several slots).
 
 ```bat
-:: Qwen3.8-27B — fully on GPU, quantized KV cache
-llama-server -m Qwen3.8-27B-UD-IQ4_XS.gguf -c 32768 -np 1 -ngl all -fa on -ctk q8_0 -ctv q8_0
+:: Qwen3.8-27B — fully on GPU, quantized KV cache, drafts with the model's own MTP head
+llama-server -m Qwen3.8-27B-UD-IQ4_XS.gguf -c 32768 -np 1 -ngl all -fa on -ctk q8_0 -ctv q8_0 --spec-type draft-mtp,ngram-mod
 
-:: Qwen3.6-35B-A3B — attention on GPU, experts of the first 18 layers in RAM
-llama-server -m Qwen3.6-35B-A3B-Q4_K_M.gguf -c 65536 -np 1 -ngl all --n-cpu-moe 18 -fa on --load-mode none
+:: Qwen3.6-35B-A3B — attention on GPU, experts of the first 15 layers in RAM, quantized KV cache
+llama-server -m Qwen3.6-35B-A3B-Q4_K_M.gguf -c 65536 -np 1 -ngl all --n-cpu-moe 15 -fa on --load-mode none -ctk q8_0 -ctv q8_0 -ub 2048 -b 2048
 
-:: gpt-oss-20b — fully on GPU (native MXFP4)
-llama-server -m gpt-oss-20b-MXFP4.gguf -c 65536 -np 1 -ngl all -fa on
+:: gpt-oss-20b — fully on GPU (native MXFP4), full context
+llama-server -m gpt-oss-20b-MXFP4.gguf -c 131072 -np 1 -ngl all -fa on
 ```
 
-`--n-cpu-moe` sweep for Qwen3.6-35B-A3B (64k ctx, total VRAM incl. desktop):
+Measured with `cargo run --release --example bench` (see *Tests*): generation on the e2e retry spec, prompt processing on a ≈12k-token prompt, total VRAM incl. the desktop.
 
-| N | VRAM | tok/s |
-|---|---|---|
-| 12 | 15.9 GB — overcommits, spills to shared memory (≈7 tok/s) | ✗ |
-| 16 | 15.4 GB | 77.7 |
-| **18** | **14.5 GB** | **73.1** |
-| 20 | 13.7 GB | 68.8 |
+**Qwen3.8-27B: speculative decoding.** The unsloth GGUF includes the model's multi-token-prediction head (`blk.64.nextn.*`), so llama-server can draft tokens with it at almost no cost (`--spec-type draft-mtp`, ≈0.3 GB VRAM). `ngram-mod` additionally drafts from text the model already produced, which pays off when a retry or re-run repeats earlier output.
+
+| `--spec-type` | Gen tok/s (run 1 / identical re-run) | Drafts accepted | VRAM |
+|---|---|---|---|
+| none (before 2026-11-14) | 49 / 49 | – | 15.5 GB |
+| `ngram-simple` | 64 / 66 | 42–44% | 14.9 GB |
+| `ngram-mod` | 54 / 88 | 23–36% | 14.9 GB |
+| `draft-mtp` | 121 / 120 | 96–97% | 15.8 GB |
+| **`draft-mtp,ngram-mod`** | **118 / 190** | 59–61% (mixed) | **15.8 GB** |
+
+Edits were valid in every run. Temperature 0.3 instead of 0.7 changed nothing (117 tok/s). Longer drafts don't help: `--spec-draft-n-max 5` (default 3) gave the same first-run speed, and 7 no longer fit in VRAM (38 tok/s). This leaves ≈0.5 GB of VRAM headroom on a 16 GB card. **If Qwen3.8 suddenly runs at a fraction of its speed, another program is using VRAM:** close it, or remove `--spec-type …` from the profile's launch arguments (−0.3 GB). A Qwen3.8 GGUF without the MTP tensors needs `--spec-type ngram-mod` or nothing instead of `draft-mtp`.
+
+N-gram drafting is **not** used for Qwen3.6-35B-A3B (first run 69 instead of 78 tok/s: with the experts in RAM, verifying rejected drafts costs more than it saves) or gpt-oss-20b (217 vs 207 tok/s, too small to bother).
+
+**Qwen3.6-35B-A3B: `--n-cpu-moe`, KV type and batch size** (64k context):
+
+| `--n-cpu-moe` | KV cache | `-ub`/`-b` | VRAM | Gen tok/s | Prompt tok/s |
+|---|---|---|---|---|---|
+| 12 | f16 | 512 | 15.9 GB — overcommits, spills to shared memory (2026-11-13) | ≈7 | – |
+| 18 (before 2026-11-14) | f16 | 512 | 13.8 GB | 78 | 1,530 |
+| 18 | f16 | 2048 | 14.2 GB | 78 | 3,660 |
+| 16 | q8_0 | 512 | 14.1 GB | 82 | 1,670 |
+| 14 | q8_0 | 512 | 15.0 GB | 88 | 1,830 |
+| 16 | q8_0 | 2048 | 14.6 GB | 81 | 3,860 |
+| **15** | **q8_0** | **2048** | **15.0 GB** | **86** | **3,920** |
+| 14 | q8_0 | 2048 | 15.4 GB | 89 | 4,170 |
+
+N = 15 is the fastest setting that keeps total VRAM at ≈15 GB; use 14 if nothing else ever runs on the GPU, 16–18 if something does.
+
+**Two slots (`-np 2`) are not used.** Two per-file calls decoded at once gave 88 instead of 48 tok/s in total on Qwen3.8 (without MTP) and 301 instead of 191 on gpt-oss, but Qwen3.8 has no VRAM left for a second slot next to MTP (which alone gives 2.5×), and each slot would have to process the shared context itself instead of reusing the primed checkpoint.
 
 `--load-mode none` (no mmap) is recommended by llama.cpp when tensors are overridden to the CPU. llama.cpp's own `--fit` (on by default when `-ngl`/`--n-cpu-moe` are not set) also works for this model and lands at ≈15.1 GB.
 
@@ -105,7 +129,7 @@ Sampling defaults: Qwen non-thinking mode `temperature 0.7, top_p 0.8, top_k 20,
 * **② Spec:** Claude's output streams in, then becomes an editable Markdown editor. Relay parses the `## Files` list: ✎ = will be edited, + = will be created, ◦ = read-only context (ticked files and any file the spec mentions are auto-included). The **context budget** shows prompt tokens + reserved output against the selected profile's context. Counts are *exact* once that profile's model is loaded (llama-server's `/tokenize`, cached per text; 2% safety margin), and estimated from text length otherwise (≈3.3 bytes/token, ~12% high on code; 5% margin); if the job doesn't fit, Relay warns and defaults to **one call per file** (each call gets the Summary, that file's `### path` section, Edge cases, Acceptance criteria and that file). You can force single/per-file mode.
   * **Context outlines:** large read-only context files (≥ 600 estimated tokens, in Python, JavaScript, TypeScript/TSX, Rust, Go, Java, C#, C or C++) are sent to the local model as an *outline*: the file with function and method bodies (and the inside of long string/array/dict literals) replaced by `… (N lines omitted)` markers, so imports, declarations, signatures, doc comments and docstrings remain, verbatim. On Relay's own sources that is 20–30% of the tokens. Their chips show an *outline* tag; click one to send that file in full for this session. Files being edited are always sent in full. Switch it off in Settings → *Context outlines*. To see what a file's outline looks like: `cargo run --example outline -- path\to\file.py`.
   * **Prompt cache:** llama-server keeps the previous prompt in its KV cache and only processes the part of a new prompt after the longest shared prefix. Relay therefore builds each local-model message as *read-only context → files to edit → spec*: per-file calls share the context, and re-running a job after editing only the spec reuses the files too. A retry continues the same conversation, so its whole first prompt comes from the cache. *Model calls* in the Result pane show each attempt's prompt tokens and how many came from the cache (`timings.cache_n`; for other OpenAI-compatible servers, `usage.prompt_tokens_details.cached_tokens` if they report it).
-  * **Cache checkpoints:** all three built-in models are hybrid (Qwen3.x: Gated DeltaNet layers with full attention in every 4th layer) or use sliding-window attention (gpt-oss). llama-server can't rewind them to an arbitrary earlier position, only to a *checkpoint*, and it leaves one shortly before the end of each request's prompt. So before the calls of a per-file run, Relay sends the shared context as its own request (`/completion`, `n_predict: 0`, cut at the exact token boundary via `/apply-template` + `/tokenize`), and every later call goes back to that checkpoint instead of processing the context again. The run log shows it as *Primed the shared context*.
+  * **Cache checkpoints:** all three built-in models are hybrid (Qwen3.x: Gated DeltaNet layers with full attention in every 4th layer) or use sliding-window attention (gpt-oss). llama-server can't rewind them to an arbitrary earlier position, only to a *checkpoint*, and it leaves one shortly before the end of each request's prompt. So before the calls of a per-file run, Relay sends the shared context as its own request (`/completion`, `n_predict: 0`, cut at the exact token boundary via `/apply-template` + `/tokenize`), and every later call goes back to that checkpoint instead of processing the context again. The run log shows it as *Primed the shared context*. Measured on all three models: the second call of a two-file run reused 2,467 of 3,501 prompt tokens with priming and 305 without.
   * **Prewarm** (Settings → *Prewarm*, off by default): while you review the spec, Relay evaluates everything before the spec (instructions, read-only context, files to edit) into the loaded model's cache, so the run only has to process the spec. It never loads a model, skips while a run is active, and editing only the spec doesn't trigger it again. Uses the GPU for a few seconds after you pick files or load a model. llama-server only (LM Studio and Ollama have no `/apply-template`).
 * **③ Result:** live output with tokens/sec, then per-file side-by-side diffs (Monaco). The right side is editable before you accept. **Accept / Reject** per file or **Accept all**. If the project is a git repo with uncommitted changes, Relay warns before the first write and offers a **checkpoint commit**. Files changed on disk since the run read them are not overwritten without asking.
   * **Re-run with another model** sends the same spec to a different profile (switching models as needed); **Compare with** shows the two models' proposals diffed against each other, with speed/time/attempt stats.
@@ -137,7 +161,7 @@ Nothing is read or written outside the selected project folder: absolute paths, 
 
 Settings → **Local models**:
 
-* **Duplicate** a built-in to experiment (e.g. a different quant, context or `--n-cpu-moe`), or **Add** a blank one. **Reset to default** restores a built-in; built-ins can't be deleted.
+* **Duplicate** a built-in to experiment (e.g. a different quant, context or `--n-cpu-moe`), or **Add** a blank one. **Reset to default** restores a built-in; built-ins can't be deleted. When an update changes a built-in's default launch arguments or context limit, a built-in that still has the previous default there takes the new one; values you changed are kept.
 * A **managed** profile needs a GGUF (explicit path, or `<models folder>/<file in repo>`), launch arguments, context limit, max output tokens, sampling, and reasoning control:
   * *Disable thinking* → `enable_thinking: false` (Qwen3.x and other templates with that switch),
   * *Reasoning effort* → `reasoning_effort` (gpt-oss, or Qwen3.8 with thinking on),
@@ -196,6 +220,7 @@ cargo test --lib                     :: unit tests
 cargo run --example e2e -- fake      :: backend end-to-end against a fake llama-server (no GPU)
 cargo run --example e2e -- claude    :: + real Claude CLI expansion and review
 cargo run --example e2e -- real      :: real llama-server + the three real models (uses the GPU!)
+cargo run --release --example bench  :: launch-argument variants of the three profiles, ≈30 min (GPU!); report in %TEMP%\relay-bench
 ```
 
 Unit tests cover the SEARCH/REPLACE parser and applier, context budgeting, context outlines (all nine grammars), path safety (including junction escapes), per-profile reasoning suppression and stripping, spec parsing, prompt templates, SSE parsing, server arguments and error diagnosis, history, and resumable/verified downloads.
