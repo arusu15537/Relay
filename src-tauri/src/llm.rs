@@ -59,6 +59,10 @@ pub struct ChatOutcome {
     pub tok_per_sec: Option<f64>,
     pub tok_per_sec_source: String,
     pub prompt_per_sec: Option<f64>,
+    /// Speculative decoding (llama-server `timings.draft_n` / `draft_n_accepted`): tokens drafted
+    /// and how many of them the model accepted.
+    pub draft_tokens: Option<u32>,
+    pub draft_accepted: Option<u32>,
     pub duration_ms: u64,
     pub ttft_ms: Option<u64>,
     pub cancelled: bool,
@@ -177,6 +181,8 @@ fn read_stats(v: &Value, out: &mut ChatOutcome) {
         if let Some(c) = num(t.get("cache_n")) {
             out.cached_tokens = Some(c);
         }
+        out.draft_tokens = num(t.get("draft_n")).or(out.draft_tokens);
+        out.draft_accepted = num(t.get("draft_n_accepted")).or(out.draft_accepted);
     }
 }
 
@@ -353,6 +359,9 @@ mod tests {
         assert_eq!((o.prompt_tokens, o.completion_tokens, o.cached_tokens), (Some(5000), Some(300), Some(4200)));
         assert_eq!(o.tok_per_sec, Some(48.5));
         assert_eq!(o.tok_per_sec_source, "server");
+        assert_eq!((o.draft_tokens, o.draft_accepted), (None, None));
+        read_stats(&json!({"timings": {"draft_n": 120, "draft_n_accepted": 90}}), &mut o);
+        assert_eq!((o.draft_tokens, o.draft_accepted), (Some(120), Some(90)));
 
         // OpenAI-compatible servers that report cached tokens in usage instead.
         let mut o = ChatOutcome::default();

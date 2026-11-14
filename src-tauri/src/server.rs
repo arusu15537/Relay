@@ -607,7 +607,7 @@ mod tests {
     fn args_put_relay_flags_last() {
         let p = &builtin_profiles()[1];
         let a = build_args(p, Path::new("D:/m/q.gguf"), 4000);
-        assert_eq!(&a[..4], &["-ngl", "all", "--n-cpu-moe", "18"]);
+        assert_eq!(&a[..4], &["-ngl", "all", "--n-cpu-moe", "15"]);
         let c = a.iter().position(|x| x == "-c").unwrap();
         assert_eq!(a[c + 1], "65536");
         assert!(a.windows(2).any(|w| w == ["-np", "1"]));

@@ -124,6 +124,14 @@ pub struct AttemptReport {
     #[serde(default)]
     pub cached_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
+    /// Prompt processing speed (tokens/s) for the part not taken from the cache.
+    #[serde(default)]
+    pub prompt_per_sec: Option<f64>,
+    /// Speculative decoding: tokens drafted and accepted (when the server reports them).
+    #[serde(default)]
+    pub draft_tokens: Option<u32>,
+    #[serde(default)]
+    pub draft_accepted: Option<u32>,
     pub duration_ms: u64,
     pub finish_reason: Option<String>,
     pub error: Option<String>,
@@ -848,6 +856,9 @@ async fn run_call(
             prompt_tokens: outcome.prompt_tokens,
             cached_tokens: outcome.cached_tokens,
             completion_tokens: outcome.completion_tokens,
+            prompt_per_sec: outcome.prompt_per_sec,
+            draft_tokens: outcome.draft_tokens,
+            draft_accepted: outcome.draft_accepted,
             duration_ms: outcome.duration_ms,
             finish_reason: outcome.finish_reason.clone(),
             error: None,

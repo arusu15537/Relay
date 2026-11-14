@@ -191,7 +191,9 @@ pub fn builtin_profiles() -> Vec<Profile> {
             hf_size: 14_352_911_264,
             hf_sha256: "4b194b34ecec99fdfb74caef84445ccd01c987de87d96ae8ca50dc434b4b0a38".into(),
             // q8_0 KV cache: 32k context at f16 would need 2 GiB and not fit next to the weights.
-            launch_args: "-ngl all -fa on -ctk q8_0 -ctv q8_0".into(),
+            // The GGUF carries an MTP head: drafting with it (+ n-grams of earlier output) measured
+            // 118–121 tok/s vs 49 plain, 97% of MTP drafts accepted, for ≈0.3 GB more VRAM.
+            launch_args: "-ngl all -fa on -ctk q8_0 -ctv q8_0 --spec-type draft-mtp,ngram-mod".into(),
             context_limit: 32768,
             max_output_tokens: 8192,
             sampling: Sampling {
@@ -214,8 +216,9 @@ pub fn builtin_profiles() -> Vec<Profile> {
             hf_file: "Qwen3.6-35B-A3B-Q4_K_M.gguf".into(),
             hf_size: 20_542_732_576,
             hf_sha256: "f4ffe03c9139e6a905a5d346f77d9fabdd179367c3280dfd005d1e75ca5ed8c8".into(),
-            // --n-cpu-moe 18 keeps total VRAM ≈14.5 GB (measured); 16 ≈15.4 GB, 20 ≈13.7 GB.
-            launch_args: "-ngl all --n-cpu-moe 18 -fa on --load-mode none".into(),
+            // q8_0 KV frees room for three more expert layers on the GPU (--n-cpu-moe 15, total VRAM
+            // ≈15.0 GB measured, 86 tok/s vs 78); -ub/-b 2048 speed up prompt processing ≈2.5×.
+            launch_args: "-ngl all --n-cpu-moe 15 -fa on --load-mode none -ctk q8_0 -ctv q8_0 -ub 2048 -b 2048".into(),
             context_limit: 65536,
             max_output_tokens: 8192,
             sampling: Sampling {
@@ -239,7 +242,8 @@ pub fn builtin_profiles() -> Vec<Profile> {
             hf_size: 12_109_566_624,
             hf_sha256: "27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901".into(),
             launch_args: "-ngl all -fa on".into(),
-            context_limit: 65536,
+            // Native context; ≈14.9 GB total VRAM measured, same speed as 64k.
+            context_limit: 131072,
             max_output_tokens: 8192,
             // OpenAI recommends temperature 1.0 / top_p 1.0 for gpt-oss.
             sampling: Sampling {
@@ -287,12 +291,39 @@ pub fn save_settings(s: &Settings) -> Result<()> {
 /// Load profiles; built-ins that are missing from the file are added back.
 pub fn load_profiles() -> Vec<Profile> {
     let mut list: Vec<Profile> = read_json(&app_dir().join("profiles.json")).ok().flatten().unwrap_or_default();
+    upgrade_untouched_builtins(&mut list);
     for b in builtin_profiles().into_iter().rev() {
         if !list.iter().any(|p| p.id == b.id) {
             list.insert(0, b);
         }
     }
     list
+}
+
+/// Launch arguments and context limits that earlier versions shipped for the built-ins.
+fn previous_defaults(id: &str) -> (&'static [&'static str], &'static [u32]) {
+    match id {
+        "qwen3.8-27b" => (&["-ngl all -fa on -ctk q8_0 -ctv q8_0"], &[]),
+        "qwen3.6-35b-a3b" => (&["-ngl all --n-cpu-moe 18 -fa on --load-mode none"], &[]),
+        "gpt-oss-20b" => (&[], &[65536]),
+        _ => (&[], &[]),
+    }
+}
+
+/// A saved built-in whose launch arguments or context limit still equal an earlier default was
+/// not edited there, so it takes the current default; edited values are kept.
+pub fn upgrade_untouched_builtins(list: &mut [Profile]) {
+    for b in builtin_profiles() {
+        let (args, ctx) = previous_defaults(&b.id);
+        for p in list.iter_mut().filter(|p| p.id == b.id && p.builtin) {
+            if args.contains(&p.launch_args.trim()) {
+                p.launch_args = b.launch_args.clone();
+            }
+            if ctx.contains(&p.context_limit) {
+                p.context_limit = b.context_limit;
+            }
+        }
+    }
 }
 
 pub fn save_profiles(list: &[Profile]) -> Result<()> {
@@ -352,6 +383,35 @@ mod tests {
         assert!(b.iter().all(|p| p.builtin && !p.hf_sha256.is_empty() && p.hf_size > 0));
         assert_eq!(b[2].reasoning.mode, crate::reasoning::ReasoningMode::Effort);
         assert!(b[1].launch_args.contains("--n-cpu-moe"));
+    }
+
+    #[test]
+    fn untouched_builtins_take_new_defaults_edited_ones_are_kept() {
+        let b = builtin_profiles();
+        let mut list = b.clone();
+        for p in &mut list {
+            let (args, ctx) = previous_defaults(&p.id);
+            if let Some(a) = args.first() {
+                p.launch_args = a.to_string();
+            }
+            if let Some(c) = ctx.first() {
+                p.context_limit = *c;
+            }
+        }
+        let mut edited = list[0].clone();
+        edited.launch_args = "-ngl all -fa on -ctk q8_0 -ctv q8_0 --my-flag".into();
+        let mut custom = list[1].clone();
+        custom.id = "my-copy".into();
+        custom.builtin = false;
+        list.push(custom.clone());
+        upgrade_untouched_builtins(&mut list);
+        for (got, want) in list.iter().zip(&b) {
+            assert_eq!((&got.launch_args, got.context_limit), (&want.launch_args, want.context_limit), "{}", got.id);
+        }
+        assert_eq!(list[3].launch_args, custom.launch_args, "custom profiles are not touched");
+        let mut list = vec![edited.clone()];
+        upgrade_untouched_builtins(&mut list);
+        assert_eq!(list[0].launch_args, edited.launch_args, "edited args are kept");
     }
 
     #[test]
