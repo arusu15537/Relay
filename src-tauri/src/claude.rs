@@ -40,10 +40,18 @@ pub struct ClaudeResult {
     pub cost_usd: Option<f64>,
     pub stop_reason: Option<String>,
     pub cancelled: bool,
+    /// Prompt tokens read from / written to Claude's prompt cache.
+    #[serde(default)]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<u64>,
 }
 
 pub struct ClaudeCall<'a> {
     pub job_id: &'a str,
+    /// Stable instructions and project context, sent as (appended) system prompt so Claude's
+    /// prompt cache can reuse them across expansions; `None` sends everything as the prompt.
+    pub system: Option<String>,
     pub prompt: String,
     /// Working directory for the CLI (the project root). Tools are only enabled when set.
     pub cwd: Option<PathBuf>,
@@ -165,7 +173,16 @@ pub fn parse_cli_line(line: &str) -> (Vec<(&'static str, String)>, Option<Value>
 async fn run_cli(settings: &Settings, call: &ClaudeCall<'_>, sink: &Sink, cancel: &CancellationToken) -> Result<ClaudeResult> {
     let exe = locate_cli().ok_or_else(|| anyhow!(CLI_MISSING))?;
     let tools = call.allow_read_tools && call.cwd.is_some();
-    let args = cli_args(&settings.claude_model, &settings.claude_effort, tools);
+    let mut args = cli_args(&settings.claude_model, &settings.claude_effort, tools);
+    // A file rather than an argument: the system part can exceed the 32K command-line limit.
+    let system_file = match call.system.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(sys) => Some(SystemPromptFile::write(call.job_id, sys)?),
+        None => None,
+    };
+    if let Some(f) = &system_file {
+        args.push("--append-system-prompt-file".into());
+        args.push(f.path.to_string_lossy().into_owned());
+    }
     let ext = exe.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     let mut cmd = if ext == "cmd" || ext == "bat" {
         let mut c = tokio::process::Command::new("cmd");
@@ -262,6 +279,7 @@ async fn run_cli(settings: &Settings, call: &ClaudeCall<'_>, sink: &Sink, cancel
             r["result"].as_str().or(r["subtype"].as_str()).unwrap_or("unknown error")
         );
     }
+    drop(system_file);
     Ok(ClaudeResult {
         text: r["result"].as_str().map(String::from).unwrap_or(streamed),
         backend: "cli".into(),
@@ -270,15 +288,42 @@ async fn run_cli(settings: &Settings, call: &ClaudeCall<'_>, sink: &Sink, cancel
         cost_usd: r["total_cost_usd"].as_f64(),
         stop_reason: r["subtype"].as_str().map(String::from),
         cancelled: false,
+        cache_read_tokens: r["usage"]["cache_read_input_tokens"].as_u64(),
+        cache_write_tokens: r["usage"]["cache_creation_input_tokens"].as_u64(),
     })
+}
+
+/// The system part of a CLI call, written to `%LOCALAPPDATA%\Relay\tmp` and removed on drop.
+struct SystemPromptFile {
+    path: PathBuf,
+}
+
+impl SystemPromptFile {
+    fn write(job_id: &str, text: &str) -> Result<Self> {
+        let dir = crate::config::app_dir().join("tmp");
+        std::fs::create_dir_all(&dir)?;
+        let safe: String = job_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+            .collect();
+        let path = dir.join(format!("system-{safe}-{}.md", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for SystemPromptFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
 // API backend
 // ---------------------------------------------------------------------------------------------
 
-pub fn api_body(model: &str, effort: &str, prompt: &str) -> Value {
-    json!({
+pub fn api_body(model: &str, effort: &str, system: Option<&str>, prompt: &str) -> Value {
+    let mut body = json!({
         "model": if model.trim().is_empty() { "claude-opus-5-5" } else { model.trim() },
         "max_tokens": 64000,
         "stream": true,
@@ -286,7 +331,14 @@ pub fn api_body(model: &str, effort: &str, prompt: &str) -> Value {
         "output_config": { "effort": if effort.trim().is_empty() { "high" } else { effort.trim() } },
         "fallbacks": "default",
         "messages": [{ "role": "user", "content": prompt }],
-    })
+    });
+    // The system part is shared by every expansion of the same project and profile; an explicit
+    // breakpoint at its end lets the next expansion read it from the cache. (Automatic caching
+    // would put the breakpoint after the instruction, which never repeats.)
+    if let Some(sys) = system.filter(|s| !s.trim().is_empty()) {
+        body["system"] = json!([{ "type": "text", "text": sys, "cache_control": { "type": "ephemeral" } }]);
+    }
+    body
 }
 
 fn api_error_message(status: u16, body: &str) -> String {
@@ -311,7 +363,7 @@ async fn run_api(
 ) -> Result<ClaudeResult> {
     let key = get_secret(KEYRING_ANTHROPIC)
         .ok_or_else(|| anyhow!("No Anthropic API key saved. Add one in Settings → Claude (it is stored in Windows Credential Manager)."))?;
-    let body = api_body(&settings.claude_model, &settings.claude_effort, &call.prompt);
+    let body = api_body(&settings.claude_model, &settings.claude_effort, call.system.as_deref(), &call.prompt);
     let started = Instant::now();
     let mut attempt = 0;
     let resp = loop {
@@ -347,6 +399,8 @@ async fn run_api(
     let mut text = String::new();
     let mut stop_reason = None;
     let mut model = String::new();
+    let mut cache_read_tokens = None;
+    let mut cache_write_tokens = None;
     let mut pending = Vec::<u8>::new();
     'outer: loop {
         let next = tokio::select! {
@@ -366,7 +420,11 @@ async fn run_api(
         for payload in parser.feed(&s) {
             let Ok(v) = serde_json::from_str::<Value>(&payload) else { continue };
             match v["type"].as_str() {
-                Some("message_start") => model = v["message"]["model"].as_str().unwrap_or("").to_string(),
+                Some("message_start") => {
+                    model = v["message"]["model"].as_str().unwrap_or("").to_string();
+                    cache_read_tokens = v["message"]["usage"]["cache_read_input_tokens"].as_u64();
+                    cache_write_tokens = v["message"]["usage"]["cache_creation_input_tokens"].as_u64();
+                }
                 Some("content_block_start") if v["content_block"]["type"] == "fallback" => {
                     ev(
                         sink,
@@ -419,6 +477,8 @@ async fn run_api(
         cost_usd: None,
         stop_reason,
         cancelled: false,
+        cache_read_tokens,
+        cache_write_tokens,
     })
 }
 
@@ -444,6 +504,7 @@ pub async fn run(
 pub async fn test_backend(settings: &Settings, sink: &Sink, http: &reqwest::Client) -> Result<String> {
     let call = ClaudeCall {
         job_id: "test",
+        system: None,
         prompt: "Reply with exactly: OK".into(),
         cwd: None,
         allow_read_tools: false,
@@ -499,7 +560,44 @@ pub struct ExpandInputs<'a> {
 /// Max characters of ticked-file content to inline in the expansion prompt.
 const MAX_CONTEXT_CHARS: usize = 400_000;
 
-pub fn build_expand_prompt(inp: &ExpandInputs<'_>) -> Result<(String, Vec<String>)> {
+/// The expansion prompt, split for Claude's prompt cache: `system` holds everything before the
+/// instruction (role, project tree, selected files, budget, output rules), which stays the same
+/// across expansions of a project; `prompt` holds the instruction section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpandPrompt {
+    pub system: Option<String>,
+    pub prompt: String,
+}
+
+const INSTRUCTION_SENTINEL: &str = "\u{1}RELAY_INSTRUCTION\u{1}";
+
+/// Split a rendered template at the instruction placeholder. The heading line right above the
+/// placeholder (e.g. `# Instruction`) goes with the instruction. Without the placeholder, or with
+/// nothing before it, everything is sent as the prompt.
+pub fn split_at_instruction(rendered: &str, instruction: &str) -> ExpandPrompt {
+    let Some(pos) = rendered.find(INSTRUCTION_SENTINEL) else {
+        return ExpandPrompt {
+            system: None,
+            prompt: rendered.to_string(),
+        };
+    };
+    let line_start = rendered[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let above = rendered[..line_start].trim_end_matches(['\n', '\r', ' ']);
+    let heading_start = above.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let split = if above[heading_start..].starts_with('#') { heading_start } else { line_start };
+    let system = rendered[..split].trim_end().to_string();
+    let prompt = rendered[split..].replace(INSTRUCTION_SENTINEL, instruction).trim().to_string();
+    ExpandPrompt {
+        system: (!system.trim().is_empty()).then_some(system),
+        prompt,
+    }
+}
+
+pub fn build_expand_prompt(inp: &ExpandInputs<'_>) -> Result<(ExpandPrompt, Vec<String>)> {
+    build_expand_prompt_from(&templates::load(Template::Expand), inp)
+}
+
+pub fn build_expand_prompt_from(template: &str, inp: &ExpandInputs<'_>) -> Result<(ExpandPrompt, Vec<String>)> {
     let mut warnings = Vec::new();
     let list = list_files(inp.root, 3000)?;
     let tree = tree_text(&list, 600);
@@ -539,10 +637,10 @@ pub fn build_expand_prompt(inp: &ExpandInputs<'_>) -> Result<(String, Vec<String
         .unwrap_or_else(|| inp.root.display().to_string());
     let ctx_limit = inp.profile.context_limit.to_string();
     let guidance = budget_guidance(inp.profile, ctx_tokens);
-    let prompt = templates::render(
-        &templates::load(Template::Expand),
+    let rendered = templates::render(
+        template,
         &[
-            ("instruction", inp.instruction.trim()),
+            ("instruction", INSTRUCTION_SENTINEL),
             ("model_name", &inp.profile.name),
             ("context_limit", &ctx_limit),
             ("project_name", &project_name),
@@ -552,7 +650,7 @@ pub fn build_expand_prompt(inp: &ExpandInputs<'_>) -> Result<(String, Vec<String
             ("budget_guidance", &guidance),
         ],
     );
-    Ok((prompt, warnings))
+    Ok((split_at_instruction(&rendered, inp.instruction.trim()), warnings))
 }
 
 /// Strip anything before the first top-level heading (models sometimes add a preamble) and a
@@ -656,12 +754,64 @@ mod tests {
 
     #[test]
     fn api_body_uses_adaptive_thinking_effort_and_fallbacks() {
-        let b = api_body("", "", "x");
+        let b = api_body("", "", None, "x");
         assert_eq!(b["model"], "claude-opus-5-5");
+        assert!(b.get("system").is_none());
         assert_eq!(b["thinking"]["type"], "adaptive");
         assert_eq!(b["output_config"]["effort"], "high");
         assert_eq!(b["fallbacks"], "default");
         assert!(b.get("temperature").is_none());
+    }
+
+    #[test]
+    fn api_body_caches_the_system_part() {
+        let b = api_body("", "", Some("STABLE"), "INSTRUCTION");
+        assert_eq!(b["system"][0]["text"], "STABLE");
+        assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(b.get("cache_control").is_none(), "no automatic breakpoint after the instruction");
+        assert_eq!(b["messages"][0]["content"], "INSTRUCTION");
+    }
+
+    #[test]
+    fn split_keeps_the_heading_with_the_instruction() {
+        let r = format!("Role\n\n# Project\ntree\n\n# Instruction\n{INSTRUCTION_SENTINEL}\n");
+        let p = split_at_instruction(&r, "add retries");
+        assert_eq!(p.system.as_deref(), Some("Role\n\n# Project\ntree"));
+        assert_eq!(p.prompt, "# Instruction\nadd retries");
+        // Placeholder inline in a paragraph: split at its line.
+        let r = format!("Role\n\nDo this: {INSTRUCTION_SENTINEL}\nThen stop.");
+        let p = split_at_instruction(&r, "X");
+        assert_eq!(p.system.as_deref(), Some("Role"));
+        assert_eq!(p.prompt, "Do this: X\nThen stop.");
+        // No placeholder (edited template) or placeholder first: one prompt, no system part.
+        let p = split_at_instruction("Just text", "X");
+        assert_eq!((p.system, p.prompt.as_str()), (None, "Just text"));
+        let p = split_at_instruction(&format!("# Instruction\n{INSTRUCTION_SENTINEL}\nrules"), "X");
+        assert_eq!((p.system, p.prompt.as_str()), (None, "# Instruction\nX\nrules"));
+    }
+
+    #[test]
+    fn expand_prompt_puts_stable_context_in_the_system_part() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.py"), "def a():\n    return 1\n").unwrap();
+        let profile = &builtin_profiles()[0];
+        let build = |instruction: &str| {
+            build_expand_prompt_from(Template::Expand.default_text(), &ExpandInputs {
+                instruction,
+                root: d.path(),
+                context_files: &["a.py".to_string()],
+                profile,
+                explore: false,
+            })
+            .unwrap()
+            .0
+        };
+        let (one, two) = (build("add retries"), build("rename a"));
+        let sys = one.system.clone().expect("system part");
+        assert!(sys.contains("a.py") && sys.contains("def a():") && sys.contains("## Acceptance criteria"));
+        assert!(!sys.contains("add retries"));
+        assert_eq!(one.system, two.system, "the cacheable part must not depend on the instruction");
+        assert_eq!(one.prompt, "# Instruction\nadd retries");
     }
 
     #[test]

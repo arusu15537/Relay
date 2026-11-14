@@ -751,6 +751,58 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                 }
                 Err(e) => c.check(false, format!("expansion failed: {e}")),
             }
+
+            // Prompt cache: two expansions of the same project with different instructions. The
+            // second must read the appended system part (template, tree, files) from the cache.
+            // Tools off so each expansion is a single request and the usage numbers are clean.
+            println!("\n== Claude prompt cache across expansions");
+            let mut s = core.settings();
+            s.claude_cli_explore = false;
+            core.set_settings(s).unwrap();
+            let profile = core.profile("qwen3.8-27b").unwrap();
+            let ctx_files = vec!["src/http_client.py".to_string()];
+            let (ep, _) = relay_lib::claude::build_expand_prompt(&relay_lib::claude::ExpandInputs {
+                instruction: "x",
+                root: &project,
+                context_files: &ctx_files,
+                profile: &profile,
+                explore: false,
+            })
+            .unwrap();
+            let system_tokens = relay_lib::budget::estimate_tokens(ep.system.as_deref().unwrap_or(""));
+            let mut reads = Vec::new();
+            for (i, instruction) in ["add a timeout parameter to the HTTP client", "log every request the HTTP client makes"]
+                .into_iter()
+                .enumerate()
+            {
+                match core
+                    .expand(ExpandRequest {
+                        job_id: format!("job-cache-{i}"),
+                        instruction: instruction.into(),
+                        project_root: root.clone(),
+                        context_files: ctx_files.clone(),
+                        profile_id: "qwen3.8-27b".into(),
+                    })
+                    .await
+                {
+                    Ok(ex) => {
+                        println!(
+                            "expansion {}: cache read {:?}, write {:?} (system part ≈{system_tokens} tokens)",
+                            i + 1,
+                            ex.claude.cache_read_tokens,
+                            ex.claude.cache_write_tokens
+                        );
+                        reads.push(ex.claude.cache_read_tokens.unwrap_or(0));
+                    }
+                    Err(e) => c.check(false, format!("cache expansion {} failed: {e}", i + 1)),
+                }
+            }
+            if let [first, second] = reads[..] {
+                c.check(
+                    second >= first + u64::from(system_tokens) / 2,
+                    format!("second expansion reads the system part from Claude's cache ({first} → {second} tokens read)"),
+                );
+            }
         }
         core.shutdown().await;
     } else {

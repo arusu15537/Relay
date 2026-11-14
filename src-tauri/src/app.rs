@@ -380,7 +380,8 @@ impl AppCore {
         let cancel = self.register_job(&req.job_id);
         let call = ClaudeCall {
             job_id: &req.job_id,
-            prompt,
+            system: prompt.system,
+            prompt: prompt.prompt,
             cwd: Some(root.clone()),
             allow_read_tools: explore,
         };
@@ -566,6 +567,7 @@ impl AppCore {
         let cancel = self.register_job(job_id_for_events);
         let call = ClaudeCall {
             job_id: job_id_for_events,
+            system: None,
             prompt,
             cwd: Some(PathBuf::from(&root)),
             allow_read_tools: explore,
