@@ -146,7 +146,7 @@ pub fn parse_spec_cmd(spec: String) -> ParsedSpec {
 }
 
 #[tauri::command]
-pub fn prepare_implement(
+pub async fn prepare_implement(
     core: Core<'_>,
     root: String,
     spec: String,
@@ -155,6 +155,7 @@ pub fn prepare_implement(
     profile_id: String,
 ) -> R<Prepared> {
     core.prepare(&root, &spec, &context_files, &full_context.unwrap_or_default(), &profile_id)
+        .await
         .map_err(e)
 }
 

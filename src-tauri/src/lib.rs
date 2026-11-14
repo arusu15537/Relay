@@ -16,6 +16,7 @@ pub mod reasoning;
 pub mod server;
 pub mod spec;
 pub mod templates;
+pub mod tokens;
 pub mod winproc;
 
 use std::sync::Arc;

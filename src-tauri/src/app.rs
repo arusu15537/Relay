@@ -1,6 +1,6 @@
 //! Application core shared by the Tauri commands and the headless e2e harness.
 
-use crate::budget::SplitMode;
+use crate::budget::{SplitMode, estimate_tokens};
 use crate::claude::{self, ClaudeCall, ClaudeResult, ExpandInputs, Review};
 use crate::config::{self, Profile, ProfileKind, Settings, builtin_profiles};
 use crate::editformat::{Workspace, parse_blocks};
@@ -13,6 +13,7 @@ use crate::reasoning::strip_reasoning;
 use crate::server::{ServerManager, ServerState, ServerStatus};
 use crate::spec::{ParsedSpec, parse_spec};
 use crate::templates::{self, Template};
+use crate::tokens::{TokenCounter, TokenizerKey};
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -33,6 +34,8 @@ pub struct AppCore {
     jobs: Mutex<HashMap<String, CancellationToken>>,
     run_lock: tokio::sync::Mutex<()>,
     pub startup_notes: Vec<String>,
+    /// Exact token counts from the loaded model's tokenizer, cached per text.
+    pub tokens: TokenCounter,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +133,7 @@ impl AppCore {
             jobs: Mutex::new(HashMap::new()),
             run_lock: tokio::sync::Mutex::new(()),
             startup_notes: notes,
+            tokens: TokenCounter::default(),
         })
     }
 
@@ -419,7 +423,10 @@ impl AppCore {
 
     // ----- implement --------------------------------------------------------------------------
 
-    pub fn prepare(
+    /// Parse the spec, read the files and plan the budget. Token counts are exact (from the
+    /// model's tokenizer) when `profile_id` is loaded on a server that offers `/tokenize`, and
+    /// estimated otherwise.
+    pub async fn prepare(
         &self,
         root: &str,
         spec: &str,
@@ -428,14 +435,64 @@ impl AppCore {
         profile_id: &str,
     ) -> Result<Prepared> {
         let profile = self.profile(profile_id)?;
-        Ok(pipeline::prepare(
-            Path::new(root),
-            spec,
-            context_files,
-            &self.context_options(full_context),
-            &profile,
-            &templates::load(Template::ImplementSystem),
+        let system = templates::load(Template::ImplementSystem);
+        let opts = self.context_options(full_context);
+        let run = |count: &dyn Fn(&str) -> u32, exact: bool| {
+            pipeline::prepare_with(Path::new(root), spec, context_files, &opts, &profile, &system, count, exact)
+        };
+        let Some(key) = self.tokenizer_key(&profile) else {
+            return Ok(run(&estimate_tokens, false));
+        };
+        // First pass with what is cached; tokenize the rest, then plan again with exact counts.
+        let misses = std::cell::RefCell::new(Vec::new());
+        let first = run(
+            &|t: &str| {
+                self.tokens.cached(&key, t).unwrap_or_else(|| {
+                    misses.borrow_mut().push(t.to_string());
+                    estimate_tokens(t)
+                })
+            },
+            true,
+        );
+        let misses = misses.into_inner();
+        if misses.is_empty() {
+            return Ok(first);
+        }
+        drop(first);
+        if !self.tokens.fill(&self.http, &key, misses).await {
+            return Ok(run(&estimate_tokens, false));
+        }
+        Ok(run(
+            &|t: &str| self.tokens.cached(&key, t).unwrap_or_else(|| estimate_tokens(t)),
+            true,
         ))
+    }
+
+    /// The tokenizer for `profile` if it is the loaded profile and its server can tokenize.
+    fn tokenizer_key(&self, profile: &Profile) -> Option<TokenizerKey> {
+        let st = self.server.status();
+        if st.state != ServerState::Ready || st.profile_id.as_deref() != Some(profile.id.as_str()) {
+            return None;
+        }
+        let (model, api_key) = match profile.kind {
+            ProfileKind::Managed => (
+                profile
+                    .resolved_gguf(Path::new(&self.settings().models_dir))
+                    .to_string_lossy()
+                    .into_owned(),
+                None,
+            ),
+            ProfileKind::External => (
+                profile.external.model.clone(),
+                if profile.external.use_api_key {
+                    claude::get_secret(&Self::endpoint_key(&profile.id))
+                } else {
+                    None
+                },
+            ),
+        };
+        let key = TokenizerKey::new(&profile.id, &model, st.base_url.as_deref()?, api_key);
+        (!self.tokens.is_unsupported(&key)).then_some(key)
     }
 
     fn context_options(&self, full_context: &[String]) -> ContextOptions {
@@ -483,7 +540,17 @@ impl AppCore {
             mode: cmd.mode,
             context_options: self.context_options(&cmd.full_context),
         };
-        let result = pipeline::implement(&ctx, &req).await;
+        let prep = match self
+            .prepare(&cmd.project_root, &cmd.spec, &cmd.context_files, &cmd.full_context, &cmd.profile_id)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                self.finish_job(&run_id);
+                return Err(e);
+            }
+        };
+        let result = pipeline::implement_prepared(&ctx, &req, prep).await;
         self.finish_job(&run_id);
         let model_file = match profile.kind {
             ProfileKind::Managed => profile

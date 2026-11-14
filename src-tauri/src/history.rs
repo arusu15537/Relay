@@ -449,6 +449,7 @@ mod tests {
                 spec_tokens: 1,
                 files: vec![],
                 per_file_spec_tokens: vec![],
+                exact: false,
             }),
             files: vec![ProposedFile {
                 path: "a.txt".into(),

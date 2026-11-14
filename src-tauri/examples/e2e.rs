@@ -258,14 +258,25 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
         "server log captured",
     );
 
-    let prep = core.prepare(&root, RETRY_SPEC, &[], &[], "qwen3.8-27b").unwrap();
+    let prep = core.prepare(&root, RETRY_SPEC, &[], &[], "qwen3.8-27b").await.unwrap();
     c.check(prep.files.iter().filter(|f| f.target).count() == 2, "spec parsed: 2 target files");
+    // The fake server's /tokenize counts bytes / 4 (the estimate uses bytes / 3.3).
+    let client = prep.files.iter().find(|f| f.path == "src/http_client.py");
+    let client_bytes = std::fs::read_to_string(project.join("src/http_client.py")).unwrap().len();
+    c.check(
+        prep.budget.exact && client.is_some_and(|f| f.tokens as usize == client_bytes.div_ceil(4)),
+        format!(
+            "exact token counts from the server's /tokenize ({:?} tokens for {client_bytes} bytes, exact: {})",
+            client.map(|f| f.tokens),
+            prep.budget.exact
+        ),
+    );
     c.check(
         prep.spec.warnings.is_empty(),
         format!("hand-written spec has no warnings (no code): {:?}", prep.spec.warnings),
     );
     let ctx = ["src/models.py".to_string()];
-    let outlined = core.prepare(&root, RETRY_SPEC, &ctx, &[], "qwen3.8-27b").unwrap();
+    let outlined = core.prepare(&root, RETRY_SPEC, &ctx, &[], "qwen3.8-27b").await.unwrap();
     let m = outlined.files.iter().find(|f| f.path == "src/models.py");
     c.check(
         m.is_some_and(|f| f.outline && !f.target && f.tokens * 4 < f.full_tokens * 3),
@@ -275,7 +286,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
             m.map(|f| f.full_tokens)
         ),
     );
-    let full = core.prepare(&root, RETRY_SPEC, &ctx, &ctx, "qwen3.8-27b").unwrap();
+    let full = core.prepare(&root, RETRY_SPEC, &ctx, &ctx, "qwen3.8-27b").await.unwrap();
     let m = full.files.iter().find(|f| f.path == "src/models.py");
     c.check(
         m.is_some_and(|f| !f.outline && f.tokens == f.full_tokens),
@@ -588,7 +599,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
         std::fs::write(project.join("src/big_a.py"), &big).unwrap();
         std::fs::write(project.join("src/big_b.py"), &big).unwrap();
         let spec = "## Summary\nTouch both.\n## Files\n- `src/big_a.py` (modify)\n- `src/big_b.py` (modify)\n## Changes\n### `src/big_a.py`\nAppend a comment.\n### `src/big_b.py`\nAppend a comment.\n";
-        let prep = core.prepare(&root, spec, &[], &[], "tiny-ctx").unwrap();
+        let prep = core.prepare(&root, spec, &[], &[], "tiny-ctx").await.unwrap();
         c.check(
             prep.budget.recommended == SplitMode::PerFile,
             format!(

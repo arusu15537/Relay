@@ -1,7 +1,9 @@
 //! Context budgeting for the local model.
 //!
-//! Token counts are estimated from text length (≈3.3 bytes/token). That is deliberately a little
-//! pessimistic: Qwen's tokenizer measured ≈3.7 chars/token on Python source.
+//! Token counts come from the loaded model's tokenizer when the server offers one (llama-server
+//! `/tokenize`, see `tokens.rs`). Otherwise they are estimated from text length (≈3.3
+//! bytes/token), which is deliberately a little pessimistic: Qwen's tokenizer measured ≈3.7
+//! chars/token on Python source.
 //! A call needs: system prompt + spec + files + chat-template overhead + the reserved output
 //! (`max_tokens`, which is also what we send in the request) + reasoning reserve.
 
@@ -11,6 +13,12 @@ use serde::{Deserialize, Serialize};
 pub const MESSAGE_OVERHEAD: u32 = 16;
 /// Fraction of the context kept free as a safety margin for estimation error.
 pub const SAFETY_FRACTION: f64 = 0.05;
+/// The margin with exact token counts: only the chat template and per-file headers are estimated.
+pub const EXACT_SAFETY_FRACTION: f64 = 0.02;
+
+pub fn safety_fraction(exact: bool) -> f64 {
+    if exact { EXACT_SAFETY_FRACTION } else { SAFETY_FRACTION }
+}
 
 pub fn estimate_tokens(text: &str) -> u32 {
     if text.is_empty() {
@@ -47,6 +55,9 @@ pub struct BudgetInput {
     pub files: Vec<FileTokens>,
     /// Per-file spec size for split mode (same order as target files). Missing → spec_tokens.
     pub per_file_spec_tokens: Vec<(String, u32)>,
+    /// True if the counts come from the model's tokenizer rather than the length estimate.
+    #[serde(default)]
+    pub exact: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +83,9 @@ pub struct BudgetPlan {
     pub per_file: Vec<CallBudget>,
     pub recommended: SplitMode,
     pub warnings: Vec<String>,
+    /// True if the token counts are exact (from the model's tokenizer).
+    #[serde(default)]
+    pub exact: bool,
 }
 
 impl BudgetPlan {
@@ -81,7 +95,8 @@ impl BudgetPlan {
 }
 
 pub fn plan(input: &BudgetInput) -> BudgetPlan {
-    let usable = ((input.context_limit as f64) * (1.0 - SAFETY_FRACTION)).floor() as u32;
+    let safety = safety_fraction(input.exact);
+    let usable = ((input.context_limit as f64) * (1.0 - safety)).floor() as u32;
     let reserved = input.max_output + input.reasoning_reserve;
     let overhead = 2 * MESSAGE_OVERHEAD;
     let mut warnings = Vec::new();
@@ -147,7 +162,7 @@ pub fn plan(input: &BudgetInput) -> BudgetPlan {
                 single_total,
                 usable,
                 input.context_limit,
-                (SAFETY_FRACTION * 100.0) as u32
+                (safety * 100.0).round() as u32
             ),
         );
     }
@@ -165,6 +180,7 @@ pub fn plan(input: &BudgetInput) -> BudgetPlan {
         per_file,
         recommended,
         warnings,
+        exact: input.exact,
     }
 }
 
@@ -188,6 +204,7 @@ mod tests {
                 })
                 .collect(),
             per_file_spec_tokens: vec![],
+            exact: false,
         }
     }
 
@@ -251,6 +268,22 @@ mod tests {
         assert!(plan(&i).fits_single());
         i.reasoning_reserve = 2048;
         assert!(!plan(&i).fits_single());
+    }
+
+    #[test]
+    fn exact_counts_use_a_smaller_margin() {
+        let mut i = input(32768, vec![("a.rs", 3000, true)]);
+        let est = plan(&i);
+        i.exact = true;
+        let ex = plan(&i);
+        assert!(!est.exact && ex.exact);
+        assert_eq!(est.usable, 31129);
+        assert_eq!(ex.usable, 32112);
+        // A job just over the estimated budget fits with exact counts.
+        let mut j = input(32768, vec![("a.rs", 31129 - 500 - 1500 - 32 - 4096 - 8 + 100, true)]);
+        assert!(!plan(&j).fits_single());
+        j.exact = true;
+        assert!(plan(&j).fits_single());
     }
 
     #[test]

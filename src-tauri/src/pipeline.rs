@@ -186,7 +186,7 @@ pub fn lang_for(path: &str) -> &'static str {
 }
 
 /// Parse the spec, read the target and context files (safely), outline large context files,
-/// and compute the budget plan.
+/// and compute the budget plan with estimated token counts.
 pub fn prepare(
     root: &Path,
     spec_text: &str,
@@ -194,6 +194,22 @@ pub fn prepare(
     opts: &ContextOptions,
     profile: &Profile,
     system_prompt: &str,
+) -> Prepared {
+    prepare_with(root, spec_text, context_files, opts, profile, system_prompt, &estimate_tokens, false)
+}
+
+/// [`prepare`] with a token counter: `count` gives the size of each text sent to the model
+/// (exact counts from the model's tokenizer when `exact`).
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_with(
+    root: &Path,
+    spec_text: &str,
+    context_files: &[String],
+    opts: &ContextOptions,
+    profile: &Profile,
+    system_prompt: &str,
+    count: &dyn Fn(&str) -> u32,
+    exact: bool,
 ) -> Prepared {
     let spec = parse_spec(spec_text);
     let mut warnings = spec.warnings.clone();
@@ -219,10 +235,10 @@ pub fn prepare(
                 if !target && !exists {
                     return; // mentioned path that doesn't exist — not useful as context
                 }
-                let full_tokens = content.as_deref().map(estimate_tokens).unwrap_or(0);
+                let full_tokens = content.as_deref().map(count).unwrap_or(0);
                 let outlined = match content.as_deref() {
                     Some(text) if !target && full_tokens >= OUTLINE_MIN_TOKENS => outline::outline(&p, text)
-                        .map(|o| (estimate_tokens(&o.text), o.text))
+                        .map(|o| (count(&o.text), o.text))
                         .filter(|(t, _)| f64::from(*t) <= f64::from(full_tokens) * OUTLINE_MAX_RATIO),
                     _ => None,
                 };
@@ -282,14 +298,14 @@ pub fn prepare(
     let per_file_spec_tokens = spec
         .files
         .iter()
-        .map(|f| (f.path.clone(), estimate_tokens(&per_file_spec(&spec, &f.path))))
+        .map(|f| (f.path.clone(), count(&per_file_spec(&spec, &f.path))))
         .collect();
     let budget = budget::plan(&BudgetInput {
         context_limit: profile.context_limit,
         max_output: profile.max_output_tokens,
         reasoning_reserve: profile.reasoning.reasoning_reserve,
-        system_tokens: estimate_tokens(system_prompt),
-        spec_tokens: estimate_tokens(spec_text),
+        system_tokens: count(system_prompt),
+        spec_tokens: count(spec_text),
         files: files
             .iter()
             .filter(|f| f.error.is_none())
@@ -300,6 +316,7 @@ pub fn prepare(
             })
             .collect(),
         per_file_spec_tokens,
+        exact,
     });
     warnings.extend(budget.warnings.iter().cloned());
     Prepared {
@@ -433,18 +450,23 @@ fn ev(sink: &Sink, run_id: &str, kind: &str, extra: serde_json::Value) {
     emit(sink, "run-event", &v);
 }
 
-/// Run the implement step end to end.
+/// Run the implement step end to end (token counts estimated).
 pub async fn implement(ctx: &RunContext<'_>, req: &ImplementRequest) -> ImplementResult {
-    let started = Instant::now();
-    let root = PathBuf::from(&req.project_root);
     let prep = prepare(
-        &root,
+        &PathBuf::from(&req.project_root),
         &req.spec,
         &req.context_files,
         &req.context_options,
         ctx.profile,
         &ctx.system_prompt,
     );
+    implement_prepared(ctx, req, prep).await
+}
+
+/// Run the implement step for an already prepared request (e.g. with exact token counts).
+pub async fn implement_prepared(ctx: &RunContext<'_>, req: &ImplementRequest, prep: Prepared) -> ImplementResult {
+    let started = Instant::now();
+    let root = PathBuf::from(&req.project_root);
     let mode = req.mode.unwrap_or(prep.budget.recommended);
     let mut result = ImplementResult {
         run_id: req.run_id.clone(),
@@ -746,8 +768,13 @@ async fn run_call(
                 missing.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ")
             );
         }
-        // Keep the retry inside the budget: drop the full file contents if they don't fit.
-        let used: u32 = messages.iter().map(|m| estimate_tokens(&m.content)).sum::<u32>() + estimate_tokens(&outcome.content);
+        // Keep the retry inside the budget: drop the full file contents if they don't fit. The
+        // conversation so far is the server's own count when it reports usage (an overestimate
+        // by the reasoning tokens, which are not sent back).
+        let used: u32 = match (outcome.prompt_tokens, outcome.completion_tokens) {
+            (Some(p), Some(c)) => p + c,
+            _ => messages.iter().map(|m| estimate_tokens(&m.content)).sum::<u32>() + estimate_tokens(&outcome.content),
+        };
         let limit = (ctx.profile.context_limit as f64 * (1.0 - budget::SAFETY_FRACTION)) as u32;
         if used + estimate_tokens(&msg) + ctx.profile.max_output_tokens + ctx.profile.reasoning.reasoning_reserve > limit {
             msg = retry_message(&outcomes, &parsed.blocks, &issues, ws, false);
@@ -946,6 +973,32 @@ mod tests {
         assert!(u.tokens < OUTLINE_MIN_TOKENS && u.outline_tokens.is_none());
         let n = p.files.iter().find(|f| f.path == "notes.md").unwrap();
         assert!(n.tokens > OUTLINE_MIN_TOKENS && n.outline_tokens.is_none(), "markdown has no outline");
+    }
+
+    #[test]
+    fn prepare_with_uses_the_given_counter() {
+        let d = project();
+        let words = |t: &str| t.split_whitespace().count() as u32;
+        let p = prepare_with(
+            d.path(),
+            SPEC,
+            &[],
+            &ContextOptions::default(),
+            &builtin_profiles()[0],
+            "one two three",
+            &words,
+            true,
+        );
+        let a = p.files.iter().find(|f| f.path == "a.py").unwrap();
+        assert_eq!(a.tokens, words("def a():
+    return 1
+"));
+        assert!(p.budget.exact);
+        let est = prep(&d, &[], &ContextOptions::default());
+        assert!(!est.budget.exact);
+        assert_eq!(est.files.iter().find(|f| f.path == "a.py").unwrap().tokens, estimate_tokens("def a():
+    return 1
+"));
     }
 
     #[test]
