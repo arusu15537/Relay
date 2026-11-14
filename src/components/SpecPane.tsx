@@ -1,5 +1,5 @@
 import Editor from "@monaco-editor/react";
-import { cancelRun, implement, schedulePrepare, setSpec, toggleFullContext } from "../actions";
+import { cancelRun, implement, schedulePrepare, schedulePrewarm, setSpec, toggleFullContext } from "../actions";
 import { fmtCtx, fmtTokens } from "../api";
 import { set, useStore } from "../store";
 import type { Prepared } from "../types";
@@ -46,6 +46,7 @@ function Budget({ prepared }: { prepared: Prepared }) {
   const inPct = Math.min(100, (b.single.inputTokens / b.contextLimit) * 100);
   const outPct = Math.min(100 - inPct, (b.reservedOutput / b.contextLimit) * 100);
   const over = !b.single.fits;
+  const prewarm = useStore((s) => s.prewarm);
   return (
     <div className="budget">
       <div className="row">
@@ -63,10 +64,22 @@ function Budget({ prepared }: { prepared: Prepared }) {
         <div className="in" style={{ width: `${inPct}%` }} />
         <div className="out" style={{ width: `${outPct}%` }} />
       </div>
+      {prewarm && (
+        <div className="faint prewarm-note" style={{ fontSize: 12, color: prewarm.status === "error" ? "var(--err)" : undefined }} title="Settings → Prewarm">
+          {prewarm.status === "error" ? "Prewarm failed: " : "Prewarm: "}
+          {prewarm.message}
+        </div>
+      )}
       <div className="row wrap">
         <label className="muted" style={{ fontSize: 12 }}>
           Mode{" "}
-          <select value={mode} onChange={(e) => set({ mode: e.target.value as typeof mode })}>
+          <select
+            value={mode}
+            onChange={(e) => {
+              set({ mode: e.target.value as typeof mode });
+              schedulePrewarm(0);
+            }}
+          >
             <option value="auto">Auto ({b.recommended === "perFile" ? "split per file" : "single call"})</option>
             <option value="single">Single call</option>
             <option value="perFile">One call per file</option>

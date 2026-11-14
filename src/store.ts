@@ -76,6 +76,8 @@ export interface Store {
   spec: string;
   specStatus: T.PaneStatus;
   prepared: T.Prepared | null;
+  /** Last spec-review prewarm of the local model's prompt cache. */
+  prewarm: T.PrewarmResult | null;
   implementProfile: string;
   mode: "auto" | T.SplitMode;
 
@@ -116,6 +118,7 @@ export const useStore = create<Store>(() => ({
   spec: "",
   specStatus: "idle",
   prepared: null,
+  prewarm: null,
   implementProfile: "",
   mode: "auto",
   runs: [],

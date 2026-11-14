@@ -18,9 +18,11 @@ window can stay in the background (no screen capture, no mouse).
    ```bat
    node tools\uitest\uitest-fake.mjs   C:\tmp\shots   :: fake llama-server profiles: spec → implement → diff → accept → re-run → compare → git checkpoint → switch
    node tools\uitest\uitest-claude.mjs C:\tmp\shots   :: real Claude CLI expansion + review (fake local model)
+   node tools\uitest\uitest-prewarm.mjs C:\tmp\shots  :: exact token counts + prewarm (needs a `fake-recurrent` profile, see below)
    node tools\uitest\uitest-real.mjs   C:\tmp\shots   :: real Claude + all three real models (GPU)
    ```
 
 For the fake scenarios, point `llamaServerPath` at `tools\fake-llama-server\target\release\fake-llama-server.exe`
 and give each profile a dummy `.gguf` file. Extra flags such as `--fake-tps 60 --fake-reasoning` go in the profile's
-launch arguments.
+launch arguments. `uitest-prewarm.mjs` also needs a custom profile with id `fake-recurrent` whose launch arguments include
+`--fake-recurrent`; it resets the demo project (`git reset --hard` to its first commit) before it runs.

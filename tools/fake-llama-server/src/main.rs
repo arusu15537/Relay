@@ -1,8 +1,11 @@
 //! fake-llama-server: a stand-in for llama-server used by Relay's tests and GPU-free demos.
 //!
 //! Accepts llama-server's arguments (-m, --port, --host, -c, …), prints similar log lines,
-//! answers /health (503 while "loading", then 200), /v1/models, /tokenize and streaming
+//! answers /health (503 while "loading", then 200), /v1/models, /tokenize, /apply-template,
+//! /completion (prompt as text or token ids; `n_predict: 0` only fills the cache) and streaming
 //! /v1/chat/completions.
+//!
+//! Tokens: 4 bytes each; a token id holds its bytes (little-endian), so ids can be decoded.
 //!
 //! Extra flags: `--fake-load-ms N` (default 1200), `--fake-fail` (print a CUDA error and exit 1),
 //! `--fake-tps N` (simulated tokens/s, default 400), `--fake-reasoning` (stream reasoning_content
@@ -17,6 +20,10 @@
 //! Prompt cache: like llama-server with one slot, the part of a prompt that matches the previous
 //! request (its prompt plus the generated answer) counts as cached: `timings.cache_n`, with
 //! `timings.prompt_n` the rest (estimated as bytes / 4).
+//!
+//! `--fake-recurrent` simulates a hybrid/recurrent (or sliding-window) model: the cache can only
+//! be reused in full when the new prompt extends everything cached; otherwise only up to a
+//! checkpoint, and a request leaves a checkpoint shortly before the end of its prompt.
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -34,6 +41,7 @@ struct Opts {
     fail: bool,
     tps: f64,
     reasoning: bool,
+    recurrent: bool,
 }
 
 fn parse_args() -> Opts {
@@ -47,6 +55,7 @@ fn parse_args() -> Opts {
         fail: false,
         tps: 400.0,
         reasoning: false,
+        recurrent: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -79,6 +88,7 @@ fn parse_args() -> Opts {
             }
             "--fake-fail" => o.fail = true,
             "--fake-reasoning" => o.reasoning = true,
+            "--fake-recurrent" => o.recurrent = true,
             _ => {}
         }
         i += 1;
@@ -213,11 +223,49 @@ fn handle(stream: TcpStream, ready: &AtomicBool, o: &Opts, start: Instant) -> st
             &json!({"object":"list","data":[{"id": o.model, "object":"model"}]}).to_string(),
         ),
         ("POST", "/tokenize") => {
-            let n = body["content"]
-                .as_str()
-                .map(|s| s.len().div_ceil(4))
-                .unwrap_or(0);
-            respond(&stream, 200, &json!({"tokens": vec![1; n]}).to_string())
+            let tokens = encode(body["content"].as_str().unwrap_or(""));
+            respond(&stream, 200, &json!({ "tokens": tokens }).to_string())
+        }
+        ("POST", "/apply-template") => respond(
+            &stream,
+            200,
+            &json!({ "prompt": render_prompt(&body) }).to_string(),
+        ),
+        ("POST", "/completion") => {
+            if !is_ready {
+                return respond(
+                    &stream,
+                    503,
+                    r#"{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}"#,
+                );
+            }
+            let prompt = match &body["prompt"] {
+                Value::String(t) => t.clone(),
+                Value::Array(ids) => decode(ids),
+                _ => String::new(),
+            };
+            if body["n_predict"].as_i64() != Some(0) {
+                return respond(
+                    &stream,
+                    400,
+                    r#"{"error":{"code":400,"message":"fake-llama-server: /completion only supports n_predict 0"}}"#,
+                );
+            }
+            let cached = reuse(&prompt, o.recurrent);
+            *SLOT.lock().unwrap() = prompt.clone();
+            let (total, cache_n) = (prompt.len().div_ceil(4), cached / 4);
+            log(
+                start,
+                "I",
+                &format!("slot update_slots: prompt evaluated into cache, n_past = {cache_n} of {total} (fake, n_predict = 0)"),
+            );
+            respond(
+                &stream,
+                200,
+                &json!({"content": "", "stop": true, "tokens_evaluated": total, "tokens_cached": cache_n,
+                        "timings": {"cache_n": cache_n, "prompt_n": total - cache_n, "predicted_n": 0}})
+                .to_string(),
+            )
         }
         ("POST", "/v1/chat/completions") => {
             if !is_ready {
@@ -316,6 +364,54 @@ fn sse(mut s: &TcpStream, v: &Value) -> std::io::Result<()> {
 
 /// The previous request's prompt and answer, as the single slot's KV cache would hold them.
 static SLOT: Mutex<String> = Mutex::new(String::new());
+/// Byte positions in SLOT where a recurrent model could resume (`--fake-recurrent`).
+static CHECKPOINTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Bytes of `prompt` that can be reused from the slot, and record this request's checkpoint.
+fn reuse(prompt: &str, recurrent: bool) -> usize {
+    let slot = SLOT.lock().unwrap();
+    let mut cps = CHECKPOINTS.lock().unwrap();
+    let common = slot
+        .bytes()
+        .zip(prompt.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let reused = if !recurrent || common == slot.len() {
+        common
+    } else {
+        cps.iter().copied().filter(|&c| c <= common).max().unwrap_or(0)
+    };
+    // Whatever followed the reuse point is overwritten by this request.
+    cps.retain(|&c| c <= reused);
+    // llama-server checkpoints a few tokens before the end of the prompt.
+    cps.push(prompt.len().saturating_sub(16));
+    if cps.len() > 32 {
+        cps.remove(0);
+    }
+    reused
+}
+
+/// 4 bytes per token; the id is the bytes, little-endian (zero-padded).
+fn encode(text: &str) -> Vec<u32> {
+    text.as_bytes()
+        .chunks(4)
+        .map(|c| {
+            let mut b = [0u8; 4];
+            b[..c.len()].copy_from_slice(c);
+            u32::from_le_bytes(b)
+        })
+        .collect()
+}
+
+fn decode(ids: &[Value]) -> String {
+    let mut bytes = Vec::new();
+    for id in ids {
+        let b = (id.as_u64().unwrap_or(0) as u32).to_le_bytes();
+        let n = b.iter().rposition(|x| *x != 0).map(|i| i + 1).unwrap_or(0);
+        bytes.extend_from_slice(&b[..n]);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
 
 fn render_prompt(body: &Value) -> String {
     let mut s = String::new();
@@ -330,10 +426,7 @@ fn render_prompt(body: &Value) -> String {
 
 fn chat(stream: TcpStream, body: &Value, o: &Opts, start: Instant) -> std::io::Result<()> {
     let prompt = render_prompt(body);
-    let cached_bytes = {
-        let slot = SLOT.lock().unwrap();
-        slot.bytes().zip(prompt.bytes()).take_while(|(a, b)| a == b).count()
-    };
+    let cached_bytes = reuse(&prompt, o.recurrent);
     let user = last_user(body);
     let mut response = String::new();
     let mut reasoning = String::new();
@@ -396,7 +489,7 @@ fn chat(stream: TcpStream, body: &Value, o: &Opts, start: Instant) -> std::io::R
         s,
         &json!({"choices":[{"index":0,"finish_reason":finish,"delta":{}}]}),
     )?;
-    let total = prompt.len() / 4;
+    let total = prompt.len().div_ceil(4);
     let cache_n = cached_bytes / 4;
     let prompt_n = total - cache_n;
     *SLOT.lock().unwrap() = format!("{prompt}assistant\n{response}\n");

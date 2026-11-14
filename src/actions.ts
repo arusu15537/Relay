@@ -88,6 +88,13 @@ function onRunEvent(ev: T.RunEvent) {
     case "retry":
       updateRun(ev.runId, (r) => ({ notes: [...r.notes, `Automatic retry for call ${(ev.call ?? 0) + 1} (errors sent back to the model)`] }));
       break;
+    case "primed": {
+      const note = ev.error
+        ? `Could not prime the ${ev.label ?? "shared context"}: ${ev.error}`
+        : `Primed the ${ev.label ?? "shared context"} in the server's cache: ${ev.tokens ?? 0} tokens (${ev.processed ?? "?"} processed)`;
+      updateRun(ev.runId, (r) => ({ notes: [...r.notes, note] }));
+      break;
+    }
   }
 }
 
@@ -288,9 +295,42 @@ export function schedulePrepare(delay = 350) {
     try {
       const prepared = await api.prepareImplement(s.root, s.spec, s.checked, s.fullContext, s.implementProfile);
       set({ prepared, specStatus: get().expandStatus === "running" ? "running" : prepared.spec.files.length ? "done" : "error" });
+      schedulePrewarm();
     } catch (e) {
       set({ prepared: null });
       toast(errText(e), "error");
+    }
+  }, delay);
+}
+
+let prewarmTimer: number | undefined;
+/**
+ * While the spec is reviewed, evaluate the prompt up to the spec into the loaded model's cache
+ * (Settings → Prewarm). Only when that profile is already loaded and idle; never loads a model.
+ */
+export function schedulePrewarm(delay = 1500) {
+  window.clearTimeout(prewarmTimer);
+  prewarmTimer = window.setTimeout(async () => {
+    const s = get();
+    const st = s.server;
+    if (!s.settings?.prewarmPrompt || !s.root || !s.spec.trim() || !s.prepared?.spec.files.length) return;
+    if (st?.state !== "ready" || st.profileId !== s.implementProfile || isBusy()) return;
+    const prev = s.prewarm;
+    set({ prewarm: { status: "running", message: "Prewarming the model's prompt cache…", outcomes: [] } });
+    try {
+      const r = await api.prewarm({
+        projectRoot: s.root,
+        spec: s.spec,
+        contextFiles: s.checked,
+        fullContext: s.fullContext,
+        profileId: s.implementProfile,
+        mode: s.mode === "auto" ? null : s.mode,
+      });
+      // "warm": the same prefix is already cached (e.g. only the spec changed) — keep the result.
+      if (r.status === "warm") set({ prewarm: prev?.status === "primed" ? prev : r });
+      else set({ prewarm: r.status === "skipped" ? null : r });
+    } catch (e) {
+      set({ prewarm: { status: "error", message: errText(e), outcomes: [] } });
     }
   }, delay);
 }
@@ -333,6 +373,8 @@ export async function implement(profileId?: string, specOverride?: string) {
   if (!spec.trim()) return toast("The spec is empty", "error");
   if (s.runs.some((r) => r.status === "running")) return toast("A run is already in progress", "error");
   const runId = uid();
+  window.clearTimeout(prewarmTimer);
+  set({ prewarm: null });
   const run = newRun(runId, pid, spec);
   const st = get().server;
   if (st?.profileId !== pid || st?.state !== "ready") run.callLabel = `Loading ${run.profileName}…`;

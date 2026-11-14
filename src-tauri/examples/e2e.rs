@@ -641,6 +641,116 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
             ),
         );
 
+        println!("\n== Prompt prewarm and shared-context priming (recurrent-model fake)");
+        let mut ps = core.profiles();
+        let mut rec = ps.iter().find(|p| p.id == "qwen3.8-27b").unwrap().clone();
+        rec.id = "fake-recurrent".into();
+        rec.builtin = false;
+        rec.name = "Recurrent fake".into();
+        rec.launch_args.push_str(" --fake-recurrent");
+        ps.push(rec);
+        core.set_profiles(ps).unwrap();
+        let st = core.switch_profile("fake-recurrent").await.unwrap();
+        c.check(st.state == ServerState::Ready, "recurrent fake loaded");
+        let pspec = "## Summary\nTouch both.\n## Files\n- `src/big_a.py` (modify) — a\n- `src/big_b.py` (modify) — b\n## Changes\n### `src/big_a.py`\nAppend a comment; the models are in `src/models.py`.\n### `src/big_b.py`\nAppend a comment.\n## Edge cases\n- none\n## Acceptance criteria\n- both files end with a comment\n";
+        let pctx = vec!["src/models.py".to_string()];
+        let profile = core.profile("fake-recurrent").unwrap();
+        let system = relay_lib::templates::load(relay_lib::templates::Template::ImplementSystem);
+        let prep = core.prepare(&root, pspec, &pctx, &pctx, "fake-recurrent").await.unwrap();
+        let msgs = relay_lib::pipeline::call_messages(&prep, pspec, SplitMode::PerFile, &system);
+        // Control: plain per-file calls. The second cannot go back to the shared context.
+        let ep = relay_lib::llm::Endpoint {
+            base_url: st.base_url.clone().unwrap_or_default(),
+            model: String::new(),
+            api_key: None,
+        };
+        let http = reqwest::Client::new();
+        let mut control = Vec::new();
+        for m in &msgs {
+            let body = relay_lib::llm::build_body(&profile, "", m, 64);
+            let o = relay_lib::llm::stream_chat(&http, &ep, &body, &tokio_util::sync::CancellationToken::new(), &mut |_, _| {})
+                .await
+                .unwrap();
+            control.push(o.cached_tokens.unwrap_or(0));
+        }
+        c.check(
+            msgs.len() == 2 && control[1] < 50,
+            format!("control: without priming the second call reprocesses the shared context ({} cached)", control[1]),
+        );
+
+        // Prewarm is off by default and never loads a model.
+        let pcmd = |profile_id: &str| relay_lib::app::PrewarmCommand {
+            project_root: root.clone(),
+            spec: pspec.into(),
+            context_files: pctx.clone(),
+            full_context: pctx.clone(),
+            profile_id: profile_id.into(),
+            mode: Some(SplitMode::PerFile),
+        };
+        let off = core.prewarm(pcmd("fake-recurrent")).await.unwrap();
+        c.check(off.status == "skipped", format!("prewarm off by default: {}", off.message));
+        let mut s = core.settings();
+        s.prewarm_prompt = true;
+        core.set_settings(s).unwrap();
+        let other = core.prewarm(pcmd("qwen3.8-27b")).await.unwrap();
+        c.check(
+            other.status == "skipped" && core.server.status().profile_id.as_deref() == Some("fake-recurrent"),
+            format!("prewarm for a profile that isn't loaded does nothing: {}", other.message),
+        );
+
+        let pw = core.prewarm(pcmd("fake-recurrent")).await.unwrap();
+        let labels: Vec<&str> = pw.outcomes.iter().map(|o| o.label.as_str()).collect();
+        c.check(
+            pw.status == "primed" && labels == ["shared context", "context and files"],
+            format!("spec-review prewarm primed {labels:?}: {}", pw.message),
+        );
+        let again = core.prewarm(pcmd("fake-recurrent")).await.unwrap();
+        c.check(again.status == "warm", format!("second prewarm is a no-op: {}", again.message));
+
+        let run_cached = |resp: &relay_lib::app::ImplementResponse, i: usize| {
+            resp.result
+                .calls
+                .get(i)
+                .and_then(|c| c.attempts.first())
+                .and_then(|a| a.cached_tokens)
+                .unwrap_or(0)
+        };
+        let shared = pw.outcomes.first().map(|o| o.tokens).unwrap_or(0);
+        let through_files = pw.outcomes.get(1).map(|o| o.tokens).unwrap_or(0);
+        let pimpl = |run: &str| ImplementCommand {
+            job_id: "job-prewarm".into(),
+            run_id: Some(run.into()),
+            project_root: root.clone(),
+            instruction: "prewarm".into(),
+            spec: pspec.into(),
+            context_files: pctx.clone(),
+            full_context: pctx.clone(),
+            mode: Some(SplitMode::PerFile),
+            profile_id: "fake-recurrent".into(),
+        };
+        let resp = core.implement(pimpl("run-prewarm-1")).await.unwrap();
+        c.check(
+            resp.result.validation_ok && run_cached(&resp, 0) >= through_files && run_cached(&resp, 1) + 8 >= shared,
+            format!(
+                "after the prewarm: call 1 reuses {} of {through_files} primed tokens, call 2 reuses {} of {shared} shared",
+                run_cached(&resp, 0),
+                run_cached(&resp, 1)
+            ),
+        );
+        // Without a prewarm the run primes the shared context itself.
+        let resp = core.implement(pimpl("run-prewarm-2")).await.unwrap();
+        c.check(
+            resp.result.validation_ok && run_cached(&resp, 1) + 8 >= shared,
+            format!(
+                "run-start priming: call 2 reuses {} of {shared} shared-context tokens (control: {})",
+                run_cached(&resp, 1),
+                control[1]
+            ),
+        );
+        let mut s = core.settings();
+        s.prewarm_prompt = false;
+        core.set_settings(s).unwrap();
+
         println!("\n== Cancel a running generation");
         let mut ps = core.profiles();
         if let Some(p) = ps.iter_mut().find(|p| p.id == "gpt-oss-20b") {

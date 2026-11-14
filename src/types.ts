@@ -63,6 +63,7 @@ export interface Settings {
   autoFallback: boolean;
   fallbackProfile: string;
   outlineContext: boolean;
+  prewarmPrompt: boolean;
   lastProject: string;
   loadTimeoutSecs: number;
   loadStats: Record<string, number>;
@@ -385,7 +386,7 @@ export interface LlamaRelease {
 
 export interface RunEvent {
   runId: string;
-  kind: "start" | "callStart" | "delta" | "reasoningDelta" | "stats" | "callEnd" | "retry" | "done";
+  kind: "start" | "callStart" | "delta" | "reasoningDelta" | "stats" | "callEnd" | "retry" | "done" | "primed";
   call?: number;
   attempt?: number;
   text?: string;
@@ -397,6 +398,25 @@ export interface RunEvent {
   message?: string;
   calls?: number;
   mode?: SplitMode;
+  /** `primed`: what was evaluated into the server's prompt cache. */
+  label?: string;
+  cached?: number | null;
+  processed?: number | null;
+  ms?: number;
+}
+
+export interface PrimeOutcome {
+  label: string;
+  tokens: number;
+  cached: number | null;
+  processed: number | null;
+  ms: number;
+}
+
+export interface PrewarmResult {
+  status: "primed" | "warm" | "skipped" | "unsupported" | "cancelled" | "error" | "running";
+  message: string;
+  outcomes: PrimeOutcome[];
 }
 
 export interface ClaudeEvent {
