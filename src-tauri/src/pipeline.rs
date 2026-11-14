@@ -342,6 +342,20 @@ Each `… (N lines omitted)` line stands for code that exists in the real file b
 /// read-only context (shared by all calls of a per-file run), then the files to edit (the same
 /// when only the spec is edited and the job re-run), then the spec, which changes most.
 pub fn build_user_message(spec_text: &str, targets: &[(String, Option<String>)], context: &[ContextText]) -> String {
+    user_message(spec_text, targets, context).text
+}
+
+/// A user message from [`build_user_message`] with the byte offsets where its sections start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserMessage {
+    pub text: String,
+    /// Start of `# Files to edit` (everything before it is the read-only context).
+    pub files_at: usize,
+    /// Start of `# Specification`.
+    pub spec_at: usize,
+}
+
+pub fn user_message(spec_text: &str, targets: &[(String, Option<String>)], context: &[ContextText]) -> UserMessage {
     let mut m = String::new();
     if !context.is_empty() {
         m.push_str("# Read-only context (do NOT edit these files)\n");
@@ -355,6 +369,7 @@ pub fn build_user_message(spec_text: &str, targets: &[(String, Option<String>)],
         }
         m.push('\n');
     }
+    let files_at = m.len();
     m.push_str("# Files to edit\n");
     for (path, content) in targets {
         match content {
@@ -366,10 +381,104 @@ pub fn build_user_message(spec_text: &str, targets: &[(String, Option<String>)],
             )),
         }
     }
-    m.push_str("\n# Specification\n\n");
+    m.push('\n');
+    let spec_at = m.len();
+    m.push_str("# Specification\n\n");
     m.push_str(spec_text.trim());
     m.push_str("\n\nNow output the SEARCH/REPLACE blocks that implement the specification.");
-    m
+    UserMessage {
+        text: m,
+        files_at,
+        spec_at,
+    }
+}
+
+/// A prompt prefix to evaluate into the server's cache before the run needs it: the messages of
+/// a call, cut `cut` bytes into the last message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimePoint {
+    pub messages: Vec<ChatMessage>,
+    pub cut: usize,
+    pub label: &'static str,
+}
+
+impl PrimePoint {
+    /// The prefix text (system prompt and the start of the user message), for deduplication.
+    pub fn prefix_text(&self) -> String {
+        let mut s = String::new();
+        if let Some((last, rest)) = self.messages.split_last() {
+            for m in rest {
+                s.push_str(&m.role);
+                s.push('\n');
+                s.push_str(&m.content);
+                s.push('\n');
+            }
+            s.push_str(&last.role);
+            s.push('\n');
+            s.push_str(&last.content[..self.cut.min(last.content.len())]);
+        }
+        s
+    }
+}
+
+/// The messages of each local-model call (first attempt) of a run in `mode`.
+pub fn call_messages(prep: &Prepared, spec_text: &str, mode: SplitMode, system_prompt: &str) -> Vec<Vec<ChatMessage>> {
+    plan_calls(prep, spec_text, mode)
+        .iter()
+        .map(|c| {
+            vec![
+                ChatMessage::system(system_prompt),
+                ChatMessage::user(build_user_message(&c.spec_text, &c.targets, &c.context)),
+            ]
+        })
+        .collect()
+}
+
+/// Shared prefixes shorter than this are not worth a separate request.
+pub const MIN_PRIME_BYTES: usize = 2000;
+
+/// Prefixes worth priming for a run in `mode`:
+/// * per-file runs with several calls: the read-only context all calls share, so the server can
+///   return to it after each call (hybrid and sliding-window models only reuse a prefix that ends
+///   at a cache checkpoint, and a request leaves one at the end of its prompt);
+/// * `through_files`: everything before the first call's spec, so only the spec is left to
+///   process when the run starts.
+pub fn prime_points(prep: &Prepared, spec_text: &str, mode: SplitMode, system_prompt: &str, through_files: bool) -> Vec<PrimePoint> {
+    let calls = plan_calls(prep, spec_text, mode);
+    let messages: Vec<UserMessage> = calls
+        .iter()
+        .map(|c| user_message(&c.spec_text, &c.targets, &c.context))
+        .collect();
+    let Some(first) = messages.first() else {
+        return vec![];
+    };
+    let with_system = |text: &str| vec![ChatMessage::system(system_prompt), ChatMessage::user(text)];
+    let mut points = Vec::new();
+    if mode == SplitMode::PerFile && messages.len() >= 2 {
+        // The longest prefix every call shares, cut back to a line start.
+        let shared = messages[1..]
+            .iter()
+            .map(|m| first.text.bytes().zip(m.text.bytes()).take_while(|(a, b)| a == b).count())
+            .min()
+            .unwrap_or(0)
+            .min(first.files_at);
+        let cut = first.text[..shared].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        if cut >= MIN_PRIME_BYTES {
+            points.push(PrimePoint {
+                messages: with_system(&first.text),
+                cut,
+                label: "shared context",
+            });
+        }
+    }
+    if through_files {
+        points.push(PrimePoint {
+            messages: with_system(&first.text),
+            cut: first.spec_at,
+            label: "context and files",
+        });
+    }
+    points
 }
 
 struct CallPlan {
@@ -999,6 +1108,59 @@ mod tests {
         assert_eq!(est.files.iter().find(|f| f.path == "a.py").unwrap().tokens, estimate_tokens("def a():
     return 1
 "));
+    }
+
+    #[test]
+    fn user_message_offsets_mark_the_sections() {
+        let ctx = [ContextText {
+            path: "u.py".into(),
+            text: "y".into(),
+            outline: false,
+        }];
+        let m = user_message("SPEC", &[("a.py".into(), Some("x = 1\n".into()))], &ctx);
+        assert!(m.text[m.files_at..].starts_with("# Files to edit\n"));
+        assert!(m.text[m.spec_at..].starts_with("# Specification\n\nSPEC"));
+        assert!(m.text[..m.files_at].starts_with("# Read-only context"));
+        let m = user_message("S", &[("a.py".into(), None)], &[]);
+        assert_eq!(m.files_at, 0);
+    }
+
+    #[test]
+    fn prime_points_cover_the_shared_context_and_the_first_call() {
+        let d = project();
+        std::fs::write(d.path().join("util.py"), big_py(60)).unwrap();
+        let opts = ContextOptions {
+            outlines: true,
+            full: vec!["util.py".into()],
+        };
+        let p = prepare(d.path(), SPEC, &[], &opts, &builtin_profiles()[0], "sys");
+        let calls = plan_calls(&p, SPEC, SplitMode::PerFile);
+        let second = build_user_message(&calls[1].spec_text, &calls[1].targets, &calls[1].context);
+
+        let pts = prime_points(&p, SPEC, SplitMode::PerFile, "sys", true);
+        assert_eq!(pts.iter().map(|x| x.label).collect::<Vec<_>>(), vec!["shared context", "context and files"]);
+        let shared = &pts[0];
+        let text = &shared.messages[1].content;
+        assert_eq!(shared.messages[0].content, "sys");
+        assert!(text[..shared.cut].contains("## `util.py`") && !text[..shared.cut].contains("# Files to edit"));
+        assert!(text[..shared.cut].ends_with('\n'));
+        assert!(second.starts_with(&text[..shared.cut]), "the second call starts with the primed prefix");
+        let files = &pts[1];
+        assert!(files.messages[1].content[files.cut..].starts_with("# Specification"));
+
+        // Single mode: only the prefix before the spec, and only when asked.
+        let single = prime_points(&p, SPEC, SplitMode::Single, "sys", true);
+        assert_eq!(single.len(), 1);
+        assert!(prime_points(&p, SPEC, SplitMode::Single, "sys", false).is_empty());
+        // Editing the spec leaves the prefixes unchanged.
+        let edited = SPEC.replace("change a", "change a differently");
+        let again = prime_points(&p, &edited, SplitMode::PerFile, "sys", true);
+        assert_eq!(again[0].prefix_text(), pts[0].prefix_text());
+        assert_eq!(again[1].prefix_text(), pts[1].prefix_text());
+        // Without a large shared context there is nothing worth priming separately.
+        std::fs::write(d.path().join("util.py"), "X = 1\n").unwrap();
+        let small = prepare(d.path(), SPEC, &[], &ContextOptions::default(), &builtin_profiles()[0], "sys");
+        assert!(prime_points(&small, SPEC, SplitMode::PerFile, "sys", false).is_empty());
     }
 
     #[test]

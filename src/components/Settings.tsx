@@ -1,7 +1,7 @@
 import Editor from "@monaco-editor/react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
-import { saveProfiles, saveSettings, schedulePrepare, switchProfile } from "../actions";
+import { saveProfiles, saveSettings, schedulePrepare, schedulePrewarm, switchProfile } from "../actions";
 import { api, errText, fmtBytes } from "../api";
 import { ask, set, toast, useStore } from "../store";
 import type { HfFile, ModelFileStatus, Profile, ProfileTest, TemplateInfo } from "../types";
@@ -106,6 +106,21 @@ function General() {
             }}
           />{" "}
           Send large context files as outlines
+        </label>
+      </Field>
+      <Field
+        label="Prewarm"
+        hint="While you review the spec, evaluate everything before it (instructions, read-only context, files to edit) into the loaded model's prompt cache, so a run only has to process the spec. Uses the GPU for a few seconds after you pick files; never loads a model. Works with llama-server (managed, or external)."
+      >
+        <label className="row">
+          <input
+            type="checkbox"
+            checked={s.prewarmPrompt}
+            onChange={(e) => {
+              void saveSettings({ prewarmPrompt: e.target.checked }).then(() => schedulePrewarm(0));
+            }}
+          />{" "}
+          Prewarm the prompt cache while I review the spec
         </label>
       </Field>
       <Field label="Auto-fallback" hint="If a model's output fails edit-format validation twice, offer to retry the same spec with the fallback profile.">

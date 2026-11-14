@@ -11,6 +11,7 @@ pub mod llm;
 pub mod outline;
 pub mod pathsafe;
 pub mod pipeline;
+pub mod prewarm;
 pub mod project;
 pub mod reasoning;
 pub mod server;
@@ -61,6 +62,7 @@ pub fn run() {
             commands::expand,
             commands::parse_spec_cmd,
             commands::prepare_implement,
+            commands::prewarm,
             commands::implement,
             commands::cancel_job,
             commands::accept_file,

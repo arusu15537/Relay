@@ -160,6 +160,11 @@ pub async fn prepare_implement(
 }
 
 #[tauri::command]
+pub async fn prewarm(core: Core<'_>, cmd: crate::app::PrewarmCommand) -> R<crate::app::PrewarmResult> {
+    core.prewarm(cmd).await.map_err(e)
+}
+
+#[tauri::command]
 pub async fn implement(core: Core<'_>, cmd: ImplementCommand) -> R<ImplementResponse> {
     core.implement(cmd).await.map_err(e)
 }

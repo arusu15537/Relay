@@ -8,6 +8,7 @@ use crate::events::Sink;
 use crate::history::{History, JobRecord};
 use crate::llm::{ChatMessage, Endpoint, build_body, stream_chat};
 use crate::pipeline::{self, ContextOptions, ImplementRequest, ImplementResult, Prepared, RunContext};
+use crate::prewarm::{self, PrimeError, PrimeOutcome};
 use crate::project::{self, WriteConflict};
 use crate::reasoning::strip_reasoning;
 use crate::server::{ServerManager, ServerState, ServerStatus};
@@ -36,6 +37,45 @@ pub struct AppCore {
     pub startup_notes: Vec<String>,
     /// Exact token counts from the loaded model's tokenizer, cached per text.
     pub tokens: TokenCounter,
+    /// Cancels a spec-review prewarm when a run starts.
+    prewarm_cancel: Mutex<Option<CancellationToken>>,
+    /// What the last prewarm left in the server's cache (cleared by runs and model switches).
+    last_prewarm: Mutex<Option<u64>>,
+    /// Endpoints that cannot prewarm (no /apply-template, /tokenize or /completion).
+    prime_unsupported: Mutex<std::collections::HashSet<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrewarmCommand {
+    pub project_root: String,
+    pub spec: String,
+    #[serde(default)]
+    pub context_files: Vec<String>,
+    #[serde(default)]
+    pub full_context: Vec<String>,
+    pub profile_id: String,
+    #[serde(default)]
+    pub mode: Option<SplitMode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrewarmResult {
+    /// `primed`, `warm` (already primed), `skipped`, `unsupported`, `cancelled` or `error`.
+    pub status: String,
+    pub message: String,
+    pub outcomes: Vec<PrimeOutcome>,
+}
+
+impl PrewarmResult {
+    fn new(status: &str, message: impl Into<String>) -> Self {
+        Self {
+            status: status.into(),
+            message: message.into(),
+            outcomes: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +174,9 @@ impl AppCore {
             run_lock: tokio::sync::Mutex::new(()),
             startup_notes: notes,
             tokens: TokenCounter::default(),
+            prewarm_cancel: Mutex::new(None),
+            last_prewarm: Mutex::new(None),
+            prime_unsupported: Mutex::new(Default::default()),
         })
     }
 
@@ -260,9 +303,13 @@ impl AppCore {
                 st.hint.map(|h| format!(" — {h}")).unwrap_or_default()
             );
         }
-        Ok(match profile.kind {
+        Ok(Self::endpoint_of(&profile, &st))
+    }
+
+    fn endpoint_of(profile: &Profile, st: &ServerStatus) -> Endpoint {
+        match profile.kind {
             ProfileKind::Managed => Endpoint {
-                base_url: st.base_url.unwrap_or_default(),
+                base_url: st.base_url.clone().unwrap_or_default(),
                 model: String::new(),
                 api_key: None,
             },
@@ -270,12 +317,153 @@ impl AppCore {
                 base_url: profile.external.base_url.trim_end_matches('/').to_string(),
                 model: profile.external.model.clone(),
                 api_key: if profile.external.use_api_key {
-                    claude::get_secret(&Self::endpoint_key(profile_id))
+                    claude::get_secret(&Self::endpoint_key(&profile.id))
                 } else {
                     None
                 },
             },
-        })
+        }
+    }
+
+    /// The endpoint of `profile` if it is loaded and ready (never loads anything).
+    fn loaded_endpoint(&self, profile: &Profile) -> Option<(Endpoint, ServerStatus)> {
+        let st = self.server.status();
+        (st.state == ServerState::Ready && st.profile_id.as_deref() == Some(profile.id.as_str()))
+            .then(|| (Self::endpoint_of(profile, &st), st))
+    }
+
+    fn prime_supported(&self, endpoint: &Endpoint) -> bool {
+        !self
+            .prime_unsupported
+            .lock()
+            .unwrap()
+            .contains(&crate::tokens::root_url(&endpoint.base_url))
+    }
+
+    fn mark_prime_unsupported(&self, endpoint: &Endpoint) {
+        self.prime_unsupported
+            .lock()
+            .unwrap()
+            .insert(crate::tokens::root_url(&endpoint.base_url));
+    }
+
+    /// While the spec is reviewed: evaluate everything before the spec (and, for per-file runs,
+    /// the shared context) into the loaded model's cache, so the run only processes the spec.
+    /// Does nothing unless the setting is on and the profile is already loaded and idle.
+    pub async fn prewarm(&self, cmd: PrewarmCommand) -> Result<PrewarmResult> {
+        if !self.settings().prewarm_prompt {
+            return Ok(PrewarmResult::new("skipped", "Prewarming is off"));
+        }
+        let profile = self.profile(&cmd.profile_id)?;
+        let Some((endpoint, st)) = self.loaded_endpoint(&profile) else {
+            return Ok(PrewarmResult::new("skipped", format!("{} is not loaded", profile.name)));
+        };
+        if !self.prime_supported(&endpoint) {
+            return Ok(PrewarmResult::new("unsupported", "This server cannot prewarm prompts"));
+        }
+        let Ok(_guard) = self.run_lock.try_lock() else {
+            return Ok(PrewarmResult::new("skipped", "A run is in progress"));
+        };
+        let prep = self
+            .prepare(&cmd.project_root, &cmd.spec, &cmd.context_files, &cmd.full_context, &cmd.profile_id)
+            .await?;
+        let mode = cmd.mode.unwrap_or(prep.budget.recommended);
+        if mode == SplitMode::Single && !prep.budget.single.fits {
+            return Ok(PrewarmResult::new("skipped", "The job does not fit in one call"));
+        }
+        let system = templates::load(Template::ImplementSystem);
+        let points = pipeline::prime_points(&prep, &cmd.spec, mode, &system, true);
+        if points.is_empty() {
+            return Ok(PrewarmResult::new("skipped", "Nothing to prewarm"));
+        }
+        let sig = prewarm_signature(&profile, &st, &points);
+        if *self.last_prewarm.lock().unwrap() == Some(sig) {
+            return Ok(PrewarmResult::new("warm", "Already in the model's cache"));
+        }
+        let cancel = CancellationToken::new();
+        *self.prewarm_cancel.lock().unwrap() = Some(cancel.clone());
+        let mut res = PrewarmResult::new("primed", "");
+        for p in &points {
+            match prewarm::prime(&self.http, &self.stream_http, &endpoint, &profile, p, &cancel).await {
+                Ok(o) => res.outcomes.push(o),
+                Err(PrimeError::Unsupported) => {
+                    self.mark_prime_unsupported(&endpoint);
+                    return Ok(PrewarmResult::new("unsupported", "This server cannot prewarm prompts"));
+                }
+                Err(PrimeError::Cancelled) => {
+                    res.status = "cancelled".into();
+                    res.message = "Cancelled (a run started)".into();
+                    return Ok(res);
+                }
+                Err(PrimeError::Failed(m)) => {
+                    res.status = "error".into();
+                    res.message = m;
+                    return Ok(res);
+                }
+            }
+        }
+        *self.last_prewarm.lock().unwrap() = Some(sig);
+        let last = res.outcomes.last().cloned().unwrap_or_default();
+        res.message = format!(
+            "{} prompt tokens ready in {}'s cache ({} processed in {:.1}s)",
+            last.tokens,
+            profile.name,
+            res.outcomes.iter().filter_map(|o| o.processed).sum::<u32>(),
+            res.outcomes.iter().map(|o| o.ms).sum::<u64>() as f64 / 1000.0
+        );
+        Ok(res)
+    }
+
+    /// Per-file runs: prime the context the calls share, so each call after the first can go back
+    /// to it instead of processing it again. Skipped when a spec-review prewarm already primed
+    /// exactly this run (priming again would discard its deeper checkpoint).
+    #[allow(clippy::too_many_arguments)]
+    async fn prime_shared_context(
+        &self,
+        run_id: &str,
+        profile: &Profile,
+        endpoint: &Endpoint,
+        prep: &Prepared,
+        spec: &str,
+        cancel: &CancellationToken,
+        prewarmed: Option<u64>,
+    ) {
+        let system = templates::load(Template::ImplementSystem);
+        if let (Some(sig), Some((_, st))) = (prewarmed, self.loaded_endpoint(profile))
+            && prewarm_signature(profile, &st, &pipeline::prime_points(prep, spec, SplitMode::PerFile, &system, true)) == sig
+        {
+            return;
+        }
+        self.prime_points_for_run(run_id, profile, endpoint, prep, spec, cancel, &system).await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prime_points_for_run(
+        &self,
+        run_id: &str,
+        profile: &Profile,
+        endpoint: &Endpoint,
+        prep: &Prepared,
+        spec: &str,
+        cancel: &CancellationToken,
+        system: &str,
+    ) {
+        if !self.prime_supported(endpoint) {
+            return;
+        }
+        for p in pipeline::prime_points(prep, spec, SplitMode::PerFile, system, false) {
+            let ev = match prewarm::prime(&self.http, &self.stream_http, endpoint, profile, &p, cancel).await {
+                Ok(o) => serde_json::json!({ "runId": run_id, "kind": "primed", "label": o.label, "tokens": o.tokens,
+                                             "cached": o.cached, "processed": o.processed, "ms": o.ms }),
+                Err(PrimeError::Unsupported) => {
+                    self.mark_prime_unsupported(endpoint);
+                    return;
+                }
+                Err(PrimeError::Cancelled) => return,
+                Err(PrimeError::Failed(m)) => serde_json::json!({ "runId": run_id, "kind": "primed", "label": p.label, "error": m }),
+            };
+            crate::events::emit(&self.sink, "run-event", &ev);
+        }
     }
 
     /// Load the profile and run a tiny edit task to check speed, reasoning handling and format.
@@ -503,7 +691,12 @@ impl AppCore {
     }
 
     pub async fn implement(&self, cmd: ImplementCommand) -> Result<ImplementResponse> {
+        if let Some(t) = self.prewarm_cancel.lock().unwrap().take() {
+            t.cancel();
+        }
         let _guard = self.run_lock.lock().await;
+        // The run replaces what a prewarm left in the server's cache.
+        let prewarmed = self.last_prewarm.lock().unwrap().take();
         let settings = self.settings();
         let profile = self.profile(&cmd.profile_id)?;
         if !Path::new(&cmd.project_root).is_dir() {
@@ -550,6 +743,10 @@ impl AppCore {
                 return Err(e);
             }
         };
+        if cmd.mode.unwrap_or(prep.budget.recommended) == SplitMode::PerFile {
+            self.prime_shared_context(&run_id, &profile, &ctx.endpoint, &prep, &cmd.spec, &cancel, prewarmed)
+                .await;
+        }
         let result = pipeline::implement_prepared(&ctx, &req, prep).await;
         self.finish_job(&run_id);
         let model_file = match profile.kind {
@@ -654,4 +851,15 @@ impl AppCore {
         }
         let _ = self.server.stop().await;
     }
+}
+
+/// Identifies what a prewarm leaves in the server's cache: the loaded server and the prefixes.
+fn prewarm_signature(profile: &Profile, st: &ServerStatus, points: &[pipeline::PrimePoint]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (&profile.id, st.pid, &st.base_url).hash(&mut h);
+    for p in points {
+        p.prefix_text().hash(&mut h);
+    }
+    h.finish()
 }

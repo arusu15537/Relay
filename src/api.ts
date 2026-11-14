@@ -22,6 +22,14 @@ export const api = {
   parseSpec: (spec: string) => invoke<T.ParsedSpec>("parse_spec_cmd", { spec }),
   prepareImplement: (root: string, spec: string, contextFiles: string[], fullContext: string[], profileId: string) =>
     invoke<T.Prepared>("prepare_implement", { root, spec, contextFiles, fullContext, profileId }),
+  prewarm: (cmd: {
+    projectRoot: string;
+    spec: string;
+    contextFiles: string[];
+    fullContext: string[];
+    profileId: string;
+    mode: T.SplitMode | null;
+  }) => invoke<T.PrewarmResult>("prewarm", { cmd }),
   implement: (cmd: {
     jobId: string;
     runId: string;

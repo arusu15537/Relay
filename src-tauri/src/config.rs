@@ -46,6 +46,9 @@ pub struct Settings {
     pub fallback_profile: String,
     /// Send large read-only context files to the local model as outlines (bodies omitted).
     pub outline_context: bool,
+    /// While the spec is being reviewed, evaluate the prompt up to the spec into the loaded
+    /// model's cache (uses the GPU for a few seconds; never loads a model).
+    pub prewarm_prompt: bool,
     pub last_project: String,
     pub load_timeout_secs: u64,
     /// Measured load times per profile id (seconds), used for the load-progress estimate.
@@ -67,6 +70,7 @@ impl Default for Settings {
             auto_fallback: false,
             fallback_profile: "gpt-oss-20b".into(),
             outline_context: true,
+            prewarm_prompt: false,
             last_project: String::new(),
             load_timeout_secs: 600,
             load_stats: Default::default(),
