@@ -179,6 +179,9 @@ export interface ClaudeResult {
   costUsd: number | null;
   stopReason: string | null;
   cancelled: boolean;
+  /** Prompt tokens read from Claude's prompt cache (all turns of the expansion). */
+  cacheReadTokens?: number | null;
+  cacheWriteTokens?: number | null;
 }
 
 export interface ExpandResult {
