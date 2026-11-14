@@ -261,11 +261,12 @@ export async function expand() {
       return;
     }
     const cost = res.claude.costUsd != null ? ` · $${res.claude.costUsd.toFixed(3)}` : "";
+    const cached = res.claude.cacheReadTokens ? ` · ${(res.claude.cacheReadTokens / 1000).toFixed(1)}k tokens from cache` : "";
     set({
       spec: res.spec,
       expandStatus: "done",
       specStatus: res.parsed.files.length ? "done" : "error",
-      expandInfo: `Spec written by Claude (${res.claude.backend.toUpperCase()}) in ${(res.claude.durationMs / 1000).toFixed(0)}s${cost}`,
+      expandInfo: `Spec written by Claude (${res.claude.backend.toUpperCase()}) in ${(res.claude.durationMs / 1000).toFixed(0)}s${cost}${cached}`,
     });
     for (const w of res.warnings) toast(w);
     schedulePrepare(0);
