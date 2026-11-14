@@ -145,6 +145,8 @@ export interface BudgetPlan {
   perFile: CallBudget[];
   recommended: SplitMode;
   warnings: string[];
+  /** Token counts come from the loaded model's tokenizer (false: length estimate). */
+  exact?: boolean;
 }
 
 export interface PreparedFile {

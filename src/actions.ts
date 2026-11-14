@@ -19,7 +19,12 @@ export async function boot() {
     ready: true,
   });
   for (const n of st.startupNotes) toast(n);
-  await listen<T.ServerStatus>("server-status", (e) => set({ server: e.payload }));
+  await listen<T.ServerStatus>("server-status", (e) => {
+    const wasReady = get().server?.state === "ready" && get().server?.profileId === e.payload.profileId;
+    set({ server: e.payload });
+    // Once a model is loaded the budget can use its tokenizer for exact counts.
+    if (e.payload.state === "ready" && !wasReady) schedulePrepare(0);
+  });
   await listen<string>("server-log", (e) =>
     set((s) => ({ log: s.log.length > 3000 ? [...s.log.slice(-2500), e.payload] : [...s.log, e.payload] })),
   );

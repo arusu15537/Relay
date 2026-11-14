@@ -51,10 +51,15 @@ function Budget({ prepared }: { prepared: Prepared }) {
       <div className="row">
         <span className="section-label">Context budget</span>
         <span className="muted" style={{ fontSize: 12 }}>
-          ≈{fmtTokens(b.single.inputTokens)} in + {fmtTokens(b.reservedOutput)} reserved out = {fmtTokens(total)} of {fmtTokens(b.usable)} usable ({fmtCtx(b.contextLimit)} ctx)
+          {b.exact ? "" : "≈"}
+          {fmtTokens(b.single.inputTokens)} in + {fmtTokens(b.reservedOutput)} reserved out = {fmtTokens(total)} of {fmtTokens(b.usable)} usable ({fmtCtx(b.contextLimit)} ctx)
+          {b.exact ? " · exact" : ""}
         </span>
       </div>
-      <div className={`bar ${over ? "over" : ""}`} title="Prompt tokens (estimated) and reserved output tokens vs. the profile's context">
+      <div
+        className={`bar ${over ? "over" : ""}`}
+        title={`Prompt tokens (${b.exact ? "exact, from the loaded model's tokenizer" : "estimated — exact once the model is loaded"}) and reserved output tokens vs. the profile's context`}
+      >
         <div className="in" style={{ width: `${inPct}%` }} />
         <div className="out" style={{ width: `${outPct}%` }} />
       </div>
