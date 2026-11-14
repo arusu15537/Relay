@@ -218,6 +218,10 @@ export interface AttemptReport {
   /** Prompt tokens the server reused from its prompt cache (missing in older history entries). */
   cachedTokens?: number | null;
   completionTokens: number | null;
+  promptPerSec?: number | null;
+  /** Speculative decoding: tokens drafted / accepted (llama-server timings). */
+  draftTokens?: number | null;
+  draftAccepted?: number | null;
   durationMs: number;
   finishReason: string | null;
   error: string | null;

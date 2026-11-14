@@ -33,7 +33,7 @@ impl Checks {
     }
 }
 
-const CLIENT_PY: &str = r#"import json
+pub const CLIENT_PY: &str = r#"import json
 import urllib.parse
 import urllib.request
 
@@ -95,7 +95,7 @@ Create the file. It imports `time` and defines one function:
 - A 404 raises immediately without sleeping.
 "#;
 
-fn make_project(dir: &Path) {
+pub fn make_project(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/http_client.py"), CLIENT_PY).unwrap();
@@ -142,7 +142,7 @@ fn pid_alive(pid: u32) -> bool {
 /// It must never outlive the test: a survivor keeps the test's inherited stdout pipe open, so
 /// `cargo run --example e2e | grep …` would never see EOF and appear to hang. So: no stdio, a
 /// kill-on-close job (dies with this process even if the test is interrupted), and kill on drop.
-struct Helper {
+pub struct Helper {
     child: std::process::Child,
 }
 
@@ -152,7 +152,7 @@ fn helper_job() -> Option<&'static relay_lib::winproc::TreeJob> {
 }
 
 impl Helper {
-    fn spawn(exe: &str, args: &[&str]) -> Helper {
+    pub fn spawn(exe: &str, args: &[&str]) -> Helper {
         let child = std::process::Command::new(exe)
             .args(args)
             .stdin(std::process::Stdio::null())

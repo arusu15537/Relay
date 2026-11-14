@@ -68,7 +68,8 @@ function AttemptDetails({ a }: { a: AttemptReport }) {
           {a.blocks} block(s){a.tokPerSec ? ` · ${a.tokPerSec.toFixed(1)} tok/s` : ""}
           {a.completionTokens ? ` · ${a.completionTokens} tokens` : ""}
           {a.promptTokens ? ` · prompt ${a.promptTokens}` : ""}
-          {a.promptTokens && a.cachedTokens != null ? ` (${a.cachedTokens} from cache)` : ""} · {fmtSecs(a.durationMs)}
+          {a.promptTokens && a.cachedTokens != null ? ` (${a.cachedTokens} from cache)` : ""}
+          {a.draftTokens ? ` · drafts ${Math.round(((a.draftAccepted ?? 0) / a.draftTokens) * 100)}% accepted` : ""} · {fmtSecs(a.durationMs)}
           {a.finishReason ? ` · ${a.finishReason}` : ""}
         </span>
       </div>
