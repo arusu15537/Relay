@@ -154,13 +154,14 @@ Profiles live in `%LOCALAPPDATA%\Relay\profiles.json`.
 Settings → **Prompt templates** (files in `%LOCALAPPDATA%\Relay\templates`):
 
 * `expand.md` — instruction → spec (Claude). It tells Claude to describe changes without writing code (inline names, signatures and literal values only); a spec containing multi-line code blocks gets a warning in the Spec pane. Placeholders: `{{instruction}} {{model_name}} {{context_limit}} {{project_name}} {{file_tree}} {{context_files}} {{explore_note}} {{budget_guidance}}`. The budget guidance is computed from the active profile's context limit so Claude writes tighter, self-contained per-file sections for smaller contexts.
+  Everything above the `{{instruction}}` line (including its heading) is sent as the system prompt, the instruction section as the user message, so Claude's prompt cache covers the template, file tree and selected files across expansions of a project. Keep `{{instruction}}` near the end; anything after it is not cached. The Spec pane shows the tokens read from the cache.
 * `implement-system.md` — the local model's system prompt (edit-format rules).
 * `review.md` — review prompt. Placeholders: `{{spec}} {{diff}} {{files_after}}`.
 
 ## Claude backends
 
-* **CLI (default):** `claude -p --output-format stream-json --verbose --include-partial-messages --no-session-persistence --model <id> --effort <level>`, prompt on **stdin** (Windows limits command lines to 32K chars), working directory = the project. Tools are disabled (`--tools ""`) unless *Explore project* is on (`--tools Read,Glob,Grep`). Cancelling kills the whole CLI process tree.
-* **API:** `POST https://api.anthropic.com/v1/messages` (`anthropic-version: 2026-10-21`), streaming, `thinking: {type: "adaptive"}`, `output_config.effort`, and server-side refusal fallbacks (`fallbacks: "default"`, beta `server-side-fallback-2026-07-01`). Default model `claude-opus-5-5`; effort default `high`.
+* **CLI (default):** `claude -p --output-format stream-json --verbose --include-partial-messages --no-session-persistence --model <id> --effort <level>`, prompt on **stdin** (Windows limits command lines to 32K chars), working directory = the project. Tools are disabled (`--tools ""`) unless *Explore project* is on (`--tools Read,Glob,Grep`). The stable part of the expansion prompt goes in with `--append-system-prompt-file`. Cancelling kills the whole CLI process tree.
+* **API:** `POST https://api.anthropic.com/v1/messages` (`anthropic-version: 2026-10-21`), streaming, `thinking: {type: "adaptive"}`, `output_config.effort`, `cache_control` on the system block (the stable part of the expansion prompt), and server-side refusal fallbacks (`fallbacks: "default"`, beta `server-side-fallback-2026-07-01`). Default model `claude-opus-5-5`; effort default `high`.
 
 ## Data locations
 

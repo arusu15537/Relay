@@ -598,6 +598,9 @@ pub fn build_expand_prompt(inp: &ExpandInputs<'_>) -> Result<(ExpandPrompt, Vec<
 }
 
 pub fn build_expand_prompt_from(template: &str, inp: &ExpandInputs<'_>) -> Result<(ExpandPrompt, Vec<String>)> {
+    // Templates edited on Windows (or checked out with core.autocrlf) use CRLF; normalize so the
+    // split and the cached system part don't depend on the editor.
+    let template = &template.replace("\r\n", "\n");
     let mut warnings = Vec::new();
     let list = list_files(inp.root, 3000)?;
     let tree = tree_text(&list, 600);
@@ -812,6 +815,18 @@ mod tests {
         assert!(!sys.contains("add retries"));
         assert_eq!(one.system, two.system, "the cacheable part must not depend on the instruction");
         assert_eq!(one.prompt, "# Instruction\nadd retries");
+        // A CRLF template (Windows editor, core.autocrlf) splits the same way.
+        let crlf = Template::Expand.default_text().replace("\r\n", "\n").replace('\n', "\r\n");
+        let three = build_expand_prompt_from(&crlf, &ExpandInputs {
+            instruction: "add retries",
+            root: d.path(),
+            context_files: &["a.py".to_string()],
+            profile,
+            explore: false,
+        })
+        .unwrap()
+        .0;
+        assert_eq!(three, one);
     }
 
     #[test]
