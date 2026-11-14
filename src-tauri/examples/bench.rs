@@ -405,10 +405,9 @@ async fn parallel_test(settings: &relay_lib::config::Settings, p: &Profile, proj
     if let Some(i) = args.iter().position(|a| a == "-np") {
         args[i + 1] = "2".into();
     }
-    // Same total context as one slot would have per call, so both fit.
-    if let Some(i) = args.iter().position(|a| a == "-c") {
-        args[i + 1] = (p.context_limit * 2).to_string();
-    }
+    // Keep the profile's context (a bigger KV cache would not fit next to Qwen3.8) and let both
+    // slots share it; each test request is ~2k tokens.
+    args.push("--kv-unified".into());
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let _server = e2e::Helper::spawn(&exe, &argv);
     let base = format!("http://127.0.0.1:{port}");
