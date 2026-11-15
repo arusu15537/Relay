@@ -50,7 +50,7 @@ pub fn get_app_state(core: Core<'_>) -> AppStateDto {
         templates_dir: templates::templates_dir().to_string_lossy().into_owned(),
         startup_notes: core.startup_notes.clone(),
         has_api_key: claude::get_secret(claude::KEYRING_ANTHROPIC).is_some(),
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: format!("{} · {}", env!("CARGO_PKG_VERSION"), env!("RELAY_BUILD")),
     }
 }
 

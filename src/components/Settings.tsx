@@ -691,6 +691,7 @@ export function SettingsDialog() {
   const open = useStore((s) => s.settingsOpen);
   const settings = useStore((s) => s.settings);
   const [tab, setTab] = useState<Tab>("general");
+  const version = useStore((s) => s.boot?.version);
   if (!open || !settings) return null;
   const tabs: [Tab, string][] = [
     ["general", "General"],
@@ -703,6 +704,9 @@ export function SettingsDialog() {
       <div className="dialog settings" role="dialog" aria-label="Settings">
         <div className="dhead">
           <h3>Settings</h3>
+          <span className="faint mono" style={{ fontSize: 11 }} title="Version · commit and date of this build">
+            Relay {version}
+          </span>
           <button className="small ghost" onClick={() => set({ settingsOpen: false })}>
             ✕
           </button>
