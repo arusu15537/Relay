@@ -463,6 +463,7 @@ mod tests {
             warnings: vec![],
             duration_ms: 1234,
             avg_tok_per_sec: Some(42.0),
+            workflow: None,
         }
     }
 

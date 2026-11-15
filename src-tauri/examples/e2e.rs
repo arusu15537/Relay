@@ -1,6 +1,6 @@
 //! Headless end-to-end checks for Relay's backend (the same `AppCore` the UI uses).
 //!
-//!   cargo run --example e2e -- fake     # managed fake llama-server, no GPU
+//!   cargo run --example e2e -- fake     # managed fake llama-server, no GPU (+ the planner/coder loop)
 //!   cargo run --example e2e -- claude   # + real Claude CLI expansion/review (no GPU)
 //!   cargo run --example e2e -- real     # real llama-server + the three real models (GPU!)
 //!
@@ -240,6 +240,10 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
         }
     }
     settings.auto_fallback = true;
+    // The slices up to f exercise the plain implement path; slice g turns the loop on.
+    settings.verify_enabled = false;
+    settings.loop_review = false;
+    settings.planner_backend = relay_lib::config::PlannerBackend::Claude;
     core.set_settings(settings.clone()).unwrap();
     core.set_profiles(profiles.clone()).unwrap();
 
@@ -685,7 +689,10 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
         }
         c.check(
             msgs.len() == 2 && control[1] < 50,
-            format!("control: without priming the second call reprocesses the shared context ({} cached)", control[1]),
+            format!(
+                "control: without priming the second call reprocesses the shared context ({} cached)",
+                control[1]
+            ),
         );
 
         // Prewarm is off by default and never loads a model.
@@ -825,6 +832,255 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
         let (_, runs) = core.history.get_job("job-a").unwrap().unwrap();
         c.check(runs[0].files.iter().all(|f| f.decision == "accepted"), "accept decisions recorded");
 
+        // ---- slice g: the self-reliant loop ---------------------------------------------------
+        println!("\n== Slice g: local planner + coder, verification, fix round, review, follow-up");
+        let loop_dir = base.join("loop-project");
+        let reset_loop = || {
+            let _ = std::fs::remove_dir_all(&loop_dir);
+            std::fs::create_dir_all(&loop_dir).unwrap();
+            std::fs::write(loop_dir.join("app.txt"), "status: broken\n").unwrap();
+            std::fs::write(loop_dir.join("notes.md"), "# Notes\n").unwrap();
+        };
+        reset_loop();
+        let loop_root = loop_dir.to_string_lossy().into_owned();
+        let loop_spec = "## Summary\nMark the app as fixed.\n\n## Design\n- `app.txt` holds one status line.\n\n## Files\n- `app.txt` (modify) — status line\n\n## Changes\n### `app.txt`\nThe status line must read `status: FIXED`.\n\n## Edge cases\n- None.\n\n## Acceptance criteria\n- `app.txt` contains `FIXED`.\n\n## Verification\n- build: `findstr /C:\"FIXED\" app.txt`\n";
+        let follow_spec = "## Summary\nAdd a note line.\n\n## Design\n- `app.txt` gets a second line.\n\n## Files\n- `app.txt` (modify) — note\n\n## Changes\n### `app.txt`\nAdd the line `follow-up done` after the status line.\n\n## Edge cases\n- None.\n\n## Acceptance criteria\n- The note is present.\n\n## Verification\n- build: `findstr /C:\"FIXED\" app.txt`\n";
+        set_script(
+            script,
+            serde_json::json!([
+                // Planner: first a tool call, then (after the tool result) the spec.
+                {"contains": "# Instruction", "after_tool": false, "reasoning": "Let me read app.txt first.",
+                 "tool_calls": [{"name": "read_file", "arguments": {"path": "app.txt"}}], "response": "(tools were offered, so this is not sent)"},
+                {"contains": "# Instruction", "after_tool": true, "reasoning": "app.txt says broken; the spec must make it FIXED.", "response": loop_spec},
+                // Coder, follow-up pass.
+                {"contains": "Add the line `follow-up done`", "response": "app.txt\n<<<<<<< SEARCH\nstatus: FIXED\n=======\nstatus: FIXED\nfollow-up done\n>>>>>>> REPLACE\n"},
+                // Planner, second review (the diff now has the note): pass.
+                {"contains": "follow-up done", "reasoning": "Both requirements hold.", "response": "## Verdict\nPASS — the status and the note are right.\n\n## Problems\nNone."},
+                // Planner, first review: a follow-up is needed.
+                {"contains": "# Verification results", "reasoning": "The note is missing.",
+                 "response": format!("## Verdict\nNEEDS_FIXES — the note line is missing.\n\n## Problems\n- `app.txt`: no note.\n\n=== FOLLOW-UP SPEC ===\n{follow_spec}")},
+                // Coder, fix round after the failed build.
+                {"contains": "# What failed", "response": "app.txt\n<<<<<<< SEARCH\nstatus: broken\n=======\nstatus: FIXED\n>>>>>>> REPLACE\n"},
+            ]),
+        );
+        let mut s = core.settings();
+        s.planner_backend = relay_lib::config::PlannerBackend::Local;
+        s.planner_profile = "qwen3.6-35b-a3b".into();
+        s.coder_profile = "qwen3.6-35b-a3b".into();
+        s.planner_tools = true;
+        s.verify_enabled = true;
+        s.loop_review = true;
+        s.follow_up_rounds = 1;
+        s.max_fix_rounds = 3;
+        core.set_settings(s).unwrap();
+        let t = Instant::now();
+        match core
+            .expand(ExpandRequest {
+                job_id: "job-loop".into(),
+                instruction: "mark the app as fixed".into(),
+                project_root: loop_root.clone(),
+                context_files: vec![],
+                profile_id: "qwen3.6-35b-a3b".into(),
+            })
+            .await
+        {
+            Ok(ex) => {
+                c.check(
+                    ex.claude.backend == "local" && ex.claude.model == "Qwen3.6-35B-A3B",
+                    format!(
+                        "spec written by the local planner ({} / {}) in {:.1}s",
+                        ex.claude.backend,
+                        ex.claude.model,
+                        t.elapsed().as_secs_f64()
+                    ),
+                );
+                c.check(
+                    ex.claude.tool_calls == vec!["read_file app.txt".to_string()],
+                    format!("planner read the project with a tool: {:?}", ex.claude.tool_calls),
+                );
+                c.check(
+                    ex.parsed.verification_declared && ex.parsed.verification.len() == 1 && ex.parsed.files.len() == 1,
+                    format!("planner spec parsed with its Verification section ({:?})", ex.parsed.verification),
+                );
+                // Loading the planner's model started a new server log; earlier requests never
+                // had thinking on or tools, so the whole log can be searched.
+                let log: Vec<String> = core.server.log_lines();
+                c.check(
+                    log.iter()
+                        .any(|l| l.contains("enable_thinking=true") && l.contains("tools=3") && l.contains("after_tool=false"))
+                        && log
+                            .iter()
+                            .any(|l| l.contains("enable_thinking=true") && l.contains("after_tool=true")),
+                    "planner requests have thinking on and the tools, and the tool result was sent back",
+                );
+                c.check(
+                    log.iter()
+                        .filter(|l| l.contains("enable_thinking=true"))
+                        .all(|l| l.contains("temperature=0.6")),
+                    "planner uses the thinking-mode sampling (temperature 0.6)",
+                );
+                let job = core.history.get_job("job-loop").unwrap().map(|(j, _)| j);
+                c.check(
+                    job.as_ref().is_some_and(|j| j.claude_backend == "local" && j.spec == ex.spec),
+                    "history records the local planner's spec",
+                );
+            }
+            Err(e) => c.check(false, format!("local planner failed: {e}")),
+        }
+
+        let implement_loop = |run: &str| ImplementCommand {
+            job_id: "job-loop".into(),
+            run_id: Some(run.into()),
+            project_root: loop_root.clone(),
+            instruction: "mark the app as fixed".into(),
+            spec: loop_spec.into(),
+            context_files: vec![],
+            full_context: vec![],
+            mode: None,
+            profile_id: "qwen3.6-35b-a3b".into(),
+        };
+        let log_mark = core.server.log_lines().len();
+        let t = Instant::now();
+        let resp = core.implement(implement_loop("run-loop")).await.unwrap();
+        let r = &resp.result;
+        println!("     loop took {:.1}s", t.elapsed().as_secs_f64());
+        let w = r.workflow.clone().unwrap_or_default();
+        let kinds: Vec<String> = w
+            .steps
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}{}",
+                    serde_json::to_value(s.kind).unwrap().as_str().unwrap(),
+                    if s.ok { "+" } else { "-" }
+                )
+            })
+            .collect();
+        for s in &w.steps {
+            println!("     step {:?} {} ok={} — {}", s.kind, s.label, s.ok, s.detail);
+        }
+        c.check(
+            kinds == ["stage+", "implement+", "verify-", "fix+", "verify+", "review-", "followUp+", "verify+", "review+"],
+            format!("loop: implement → build fails → fix → build passes → review asks for a follow-up → follow-up → verified → review PASS ({kinds:?})"),
+        );
+        c.check(
+            w.verified == Some(true) && w.review.as_ref().is_some_and(|rv| rv.passed),
+            format!("outcome: {}", w.outcome),
+        );
+        let fail = w.steps.iter().find(|s| s.kind == relay_lib::workflow::StepKind::Verify && !s.ok);
+        c.check(
+            fail.is_some_and(|s| s.commands.len() == 1 && s.commands[0].exit_code == Some(1) && s.commands[0].command.contains("findstr")),
+            "the failing build ran in the staging copy and reported its exit code",
+        );
+        let labels: Vec<Option<String>> = r.calls.iter().map(|c| c.label.clone()).collect();
+        c.check(
+            labels == [None, Some("Fix 1".to_string()), Some("Follow-up 1".to_string())],
+            format!("coder calls: implement, fix, follow-up ({labels:?})"),
+        );
+        let app = r.files.iter().find(|f| f.path == "app.txt");
+        c.check(
+            r.files.len() == 1
+                && app.is_some_and(|f| {
+                    f.original.as_deref() == Some("status: broken\n")
+                        && f.proposed.contains("status: FIXED\nfollow-up done\n")
+                        && !f.proposed.contains("broken")
+                }),
+            format!(
+                "one proposed file, diffed against the project as it was: {:?}",
+                app.map(|f| &f.proposed)
+            ),
+        );
+        c.check(
+            std::fs::read_to_string(loop_dir.join("app.txt")).unwrap() == "status: broken\n",
+            "the real project is untouched before accepting",
+        );
+        c.check(
+            Path::new(&w.staging_dir).join("app.txt").is_file() && !Path::new(&w.staging_dir).starts_with(&loop_dir),
+            format!("staging copy outside the project: {}", w.staging_dir),
+        );
+        let log: Vec<String> = core.server.log_lines()[log_mark..].to_vec();
+        let coder_reqs = log.iter().filter(|l| l.contains("enable_thinking=false")).count();
+        let planner_reqs = log.iter().filter(|l| l.contains("enable_thinking=true")).count();
+        c.check(
+            coder_reqs == 3 && planner_reqs == 2,
+            format!("3 coder requests with thinking off, 2 planner reviews with thinking on (got {coder_reqs} / {planner_reqs})"),
+        );
+        let (_, runs) = core.history.get_job("job-loop").unwrap().unwrap();
+        let saved = runs.iter().find(|x| x.id == "run-loop");
+        c.check(
+            saved.is_some_and(|x| {
+                x.review.is_some()
+                    && x.result
+                        .as_ref()
+                        .is_some_and(|v| v["workflow"]["steps"].as_array().is_some_and(|a| a.len() == 9))
+            }),
+            "history keeps the loop's steps and the final review",
+        );
+        let out = core.accept_file("run-loop", "app.txt", None, false).unwrap();
+        c.check(
+            out.ok
+                && std::fs::read_to_string(loop_dir.join("app.txt"))
+                    .unwrap()
+                    .starts_with("status: FIXED\nfollow-up done\n"),
+            "accepting writes the verified file into the project",
+        );
+
+        println!("\n== Slice g: cancel during verification");
+        reset_loop();
+        let slow_spec = loop_spec
+            .replace("findstr /C:\\\"FIXED\\\" app.txt", "ping -n 60 127.0.0.1")
+            .replace("findstr /C:\"FIXED\" app.txt", "ping -n 60 127.0.0.1");
+        let mut cmd = implement_loop("run-cancel");
+        cmd.spec = slow_spec;
+        let t = Instant::now();
+        let (resp, _) = tokio::join!(core.implement(cmd), async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            core.cancel("run-cancel")
+        });
+        let r = resp.unwrap().result;
+        let w = r.workflow.clone().unwrap_or_default();
+        c.check(
+            r.cancelled && t.elapsed() < Duration::from_secs(20),
+            format!(
+                "cancel stops the running command ({:.1}s, cancelled: {})",
+                t.elapsed().as_secs_f64(),
+                r.cancelled
+            ),
+        );
+        c.check(
+            w.steps.last().is_some_and(|s| {
+                s.kind == relay_lib::workflow::StepKind::Verify && !s.ok && s.commands.first().is_some_and(|c| c.cancelled)
+            }),
+            format!("the verify step records the cancelled command ({})", w.outcome),
+        );
+
+        println!("\n== Slice g: planner and coder on different models (swaps at each hand-off)");
+        reset_loop();
+        let mut s = core.settings();
+        s.planner_profile = "qwen3.8-27b".into();
+        core.set_settings(s).unwrap();
+        let resp = core.implement(implement_loop("run-swap")).await.unwrap();
+        let w = resp.result.workflow.clone().unwrap_or_default();
+        c.check(
+            w.verified == Some(true) && w.review.as_ref().is_some_and(|rv| rv.passed) && w.planner.starts_with("Qwen3.8-27B"),
+            format!("loop with planner {} and coder {}: {}", w.planner, w.coder, w.outcome),
+        );
+        let st = core.server.status();
+        c.check(
+            st.profile_id.as_deref() == Some("qwen3.8-27b") && st.state == ServerState::Ready,
+            format!("the planner's model is loaded after its final review ({:?})", st.profile_id),
+        );
+        let follow = resp.result.calls.iter().find(|c| c.label.as_deref() == Some("Follow-up 1"));
+        c.check(follow.is_some_and(|c| c.ok), "the coder's model was loaded again for the follow-up");
+
+        // Back to the plain path for the remaining slices.
+        let mut s = core.settings();
+        s.planner_backend = relay_lib::config::PlannerBackend::Claude;
+        s.verify_enabled = false;
+        s.loop_review = false;
+        core.set_settings(s).unwrap();
+        set_script(script, serde_json::json!([]));
+
         if mode == "claude" {
             println!("\n== Slice c: Claude CLI expansion (+ review)");
             make_project(&project);
@@ -914,14 +1170,18 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                 root: &project,
                 context_files: &ctx_files,
                 profile: &profile,
-                explore: false,
+                explore: relay_lib::claude::Explore::None,
+                outline_budget: 0,
             })
             .unwrap();
             let system_tokens = relay_lib::budget::estimate_tokens(ep.system.as_deref().unwrap_or(""));
             let mut reads = Vec::new();
-            for (i, instruction) in ["add a timeout parameter to the HTTP client", "log every request the HTTP client makes"]
-                .into_iter()
-                .enumerate()
+            for (i, instruction) in [
+                "add a timeout parameter to the HTTP client",
+                "log every request the HTTP client makes",
+            ]
+            .into_iter()
+            .enumerate()
             {
                 match core
                     .expand(ExpandRequest {

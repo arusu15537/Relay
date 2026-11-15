@@ -8,6 +8,8 @@ File tree (may be truncated):
 
 {{context_files}}
 
+{{project_outline}}
+
 {{explore_note}}
 
 # Budget for the implementing model
@@ -45,7 +47,17 @@ One subsection per file from the Files list, in the same order, headed `### `pat
 Bullets: each edge case and the behaviour required for it (what must happen, not how).
 
 ## Acceptance criteria
-Bullets: concrete, checkable criteria (observable behaviour, tests that must pass, structure that must hold, things that must not change).
+Bullets: concrete, checkable criteria (observable behaviour, tests that must pass, structure that must hold, things that must not change). When the project has tests, prefer criteria a test can check, and list the test file under Files.
+
+## Verification
+Relay applies the edits to a copy of the project and runs these commands there, in order; each must succeed, and failures go back to the implementing model to fix. One bullet per command, in this form:
+- setup: `command` (only for a preparation step the project does not have done yet)
+- build: `command`
+- test: `command`
+- run: `command` (timeout 10s, expect "text") — only when starting the program shows whether the change works. A program still running at the timeout counts as started fine; `expect` requires that text in its output.
+Commands detected for this project:
+{{verification_defaults}}
+Keep them unless the change needs different ones (for example a test target the change adds). Use only commands that work in cmd.exe in the project folder without user interaction, network access or installing tools. If nothing can be checked automatically, write `- None.`
 
 Rules:
 - Do not write the implementation. No code, no function bodies, no pseudo-code, no step-by-step algorithms or control flow: the implementing model writes all of the code and chooses how each operation works. Use inline `code` only for names, signatures, types and literal values. Never write expressions, formulas or call chains in code syntax (such as `min(a, b * 2 ** n)` or `self.f(self.g(x))`); when a value must follow a rule, state the rule as a requirement in words (e.g. "the delay starts at `backoff_factor` seconds, doubles after each failed attempt and never exceeds `max_backoff`").

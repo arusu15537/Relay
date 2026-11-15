@@ -45,6 +45,11 @@ pub struct ClaudeResult {
     pub cache_read_tokens: Option<u64>,
     #[serde(default)]
     pub cache_write_tokens: Option<u64>,
+    /// Local planner: generation speed and the tool calls it made.
+    #[serde(default)]
+    pub tok_per_sec: Option<f64>,
+    #[serde(default)]
+    pub tool_calls: Vec<String>,
 }
 
 pub struct ClaudeCall<'a> {
@@ -290,6 +295,7 @@ async fn run_cli(settings: &Settings, call: &ClaudeCall<'_>, sink: &Sink, cancel
         cancelled: false,
         cache_read_tokens: r["usage"]["cache_read_input_tokens"].as_u64(),
         cache_write_tokens: r["usage"]["cache_creation_input_tokens"].as_u64(),
+        ..Default::default()
     })
 }
 
@@ -363,7 +369,12 @@ async fn run_api(
 ) -> Result<ClaudeResult> {
     let key = get_secret(KEYRING_ANTHROPIC)
         .ok_or_else(|| anyhow!("No Anthropic API key saved. Add one in Settings → Claude (it is stored in Windows Credential Manager)."))?;
-    let body = api_body(&settings.claude_model, &settings.claude_effort, call.system.as_deref(), &call.prompt);
+    let body = api_body(
+        &settings.claude_model,
+        &settings.claude_effort,
+        call.system.as_deref(),
+        &call.prompt,
+    );
     let started = Instant::now();
     let mut attempt = 0;
     let resp = loop {
@@ -479,6 +490,7 @@ async fn run_api(
         cancelled: false,
         cache_read_tokens,
         cache_write_tokens,
+        ..Default::default()
     })
 }
 
@@ -549,12 +561,26 @@ pub fn budget_guidance(profile: &Profile, context_file_tokens: u32) -> String {
     g
 }
 
+/// How the spec writer can look at the project beyond what the prompt contains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Explore {
+    /// Only the prompt.
+    None,
+    /// The Claude CLI's Read/Glob/Grep tools.
+    ClaudeTools,
+    /// The local planner's read_file/list_files/search tools.
+    LocalTools,
+}
+
 pub struct ExpandInputs<'a> {
     pub instruction: &'a str,
     pub root: &'a Path,
     pub context_files: &'a [String],
+    /// The implementing (coder) profile: its context limit shapes the spec.
     pub profile: &'a Profile,
-    pub explore: bool,
+    pub explore: Explore,
+    /// Tokens of source overview (small files in full, outlines of the rest) to add; 0 = none.
+    pub outline_budget: u32,
 }
 
 /// Max characters of ticked-file content to inline in the expansion prompt.
@@ -584,7 +610,11 @@ pub fn split_at_instruction(rendered: &str, instruction: &str) -> ExpandPrompt {
     let line_start = rendered[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let above = rendered[..line_start].trim_end_matches(['\n', '\r', ' ']);
     let heading_start = above.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let split = if above[heading_start..].starts_with('#') { heading_start } else { line_start };
+    let split = if above[heading_start..].starts_with('#') {
+        heading_start
+    } else {
+        line_start
+    };
     let system = rendered[..split].trim_end().to_string();
     let prompt = rendered[split..].replace(INSTRUCTION_SENTINEL, instruction).trim().to_string();
     ExpandPrompt {
@@ -628,10 +658,25 @@ pub fn build_expand_prompt_from(template: &str, inp: &ExpandInputs<'_>) -> Resul
             }
         }
     }
-    let explore_note = if inp.explore {
-        "You may use the Read, Glob and Grep tools to inspect the project (read-only) before writing the spec. Read every file you plan to change so your instructions match the real code. Do not modify anything."
+    let explore_note = match inp.explore {
+        Explore::ClaudeTools => {
+            "You may use the Read, Glob and Grep tools to inspect the project (read-only) before writing the spec. Read every file you plan to change so your instructions match the real code. Do not modify anything."
+        }
+        Explore::LocalTools => {
+            "You can call the tools `read_file`, `list_files` and `search` to inspect the project (read-only) before writing the spec. Read every file you plan to change so the spec matches the real code; never guess what a file contains. When you have what you need, stop calling tools and write the spec."
+        }
+        Explore::None => "",
+    };
+    let outline = if inp.outline_budget > 0 {
+        crate::planner::project_outline(inp.root, inp.outline_budget, inp.context_files)
     } else {
-        ""
+        String::new()
+    };
+    let detected = crate::verify::detect(inp.root);
+    let verification_defaults = if detected.commands.is_empty() {
+        "(none detected)".to_string()
+    } else {
+        detected.commands.iter().map(|c| c.spec_line()).collect::<Vec<_>>().join("\n")
     };
     let project_name = inp
         .root
@@ -649,8 +694,10 @@ pub fn build_expand_prompt_from(template: &str, inp: &ExpandInputs<'_>) -> Resul
             ("project_name", &project_name),
             ("file_tree", &fenced_lang(&tree, "")),
             ("context_files", &ctx),
+            ("project_outline", &outline),
             ("explore_note", explore_note),
             ("budget_guidance", &guidance),
+            ("verification_defaults", &verification_defaults),
         ],
     );
     Ok((split_at_instruction(&rendered, inp.instruction.trim()), warnings))
@@ -710,7 +757,11 @@ pub fn parse_review(text: &str) -> Review {
     }
 }
 
-pub fn build_review_prompt(spec: &str, diff: &str, files_after: &[(String, String)]) -> String {
+pub fn build_review_prompt(spec: &str, diff: &str, files_after: &[(String, String)], verification: &str) -> String {
+    build_review_prompt_from(&templates::load(Template::Review), spec, diff, files_after, verification)
+}
+
+pub fn build_review_prompt_from(template: &str, spec: &str, diff: &str, files_after: &[(String, String)], verification: &str) -> String {
     let mut after = String::new();
     if !files_after.is_empty() {
         after.push_str("# Changed files after the edit (full content)\n");
@@ -719,8 +770,20 @@ pub fn build_review_prompt(spec: &str, diff: &str, files_after: &[(String, Strin
         }
     }
     templates::render(
-        &templates::load(Template::Review),
-        &[("spec", spec.trim()), ("diff", &fenced_lang(diff, "diff")), ("files_after", &after)],
+        &template.replace("\r\n", "\n"),
+        &[
+            ("spec", spec.trim()),
+            ("diff", &fenced_lang(diff, "diff")),
+            ("files_after", &after),
+            (
+                "verification",
+                if verification.trim().is_empty() {
+                    "Not run."
+                } else {
+                    verification.trim()
+                },
+            ),
+        ],
     )
 }
 
@@ -799,13 +862,17 @@ mod tests {
         std::fs::write(d.path().join("a.py"), "def a():\n    return 1\n").unwrap();
         let profile = &builtin_profiles()[0];
         let build = |instruction: &str| {
-            build_expand_prompt_from(Template::Expand.default_text(), &ExpandInputs {
-                instruction,
-                root: d.path(),
-                context_files: &["a.py".to_string()],
-                profile,
-                explore: false,
-            })
+            build_expand_prompt_from(
+                Template::Expand.default_text(),
+                &ExpandInputs {
+                    instruction,
+                    root: d.path(),
+                    context_files: &["a.py".to_string()],
+                    profile,
+                    explore: Explore::None,
+                    outline_budget: 0,
+                },
+            )
             .unwrap()
             .0
         };
@@ -817,16 +884,57 @@ mod tests {
         assert_eq!(one.prompt, "# Instruction\nadd retries");
         // A CRLF template (Windows editor, core.autocrlf) splits the same way.
         let crlf = Template::Expand.default_text().replace("\r\n", "\n").replace('\n', "\r\n");
-        let three = build_expand_prompt_from(&crlf, &ExpandInputs {
-            instruction: "add retries",
-            root: d.path(),
-            context_files: &["a.py".to_string()],
-            profile,
-            explore: false,
-        })
+        let three = build_expand_prompt_from(
+            &crlf,
+            &ExpandInputs {
+                instruction: "add retries",
+                root: d.path(),
+                context_files: &["a.py".to_string()],
+                profile,
+                explore: Explore::None,
+                outline_budget: 0,
+            },
+        )
         .unwrap()
         .0;
         assert_eq!(three, one);
+    }
+
+    #[test]
+    fn expand_prompt_lists_detected_commands_and_the_source_overview() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::create_dir_all(d.path().join("src")).unwrap();
+        std::fs::write(d.path().join("src/main.rs"), "fn main() {\n    println!(\"hi\");\n}\n").unwrap();
+        let (p, _) = build_expand_prompt_from(
+            Template::Expand.default_text(),
+            &ExpandInputs {
+                instruction: "greet",
+                root: d.path(),
+                context_files: &[],
+                profile: &builtin_profiles()[1],
+                explore: Explore::LocalTools,
+                outline_budget: 4000,
+            },
+        )
+        .unwrap();
+        let sys = p.system.unwrap();
+        assert!(sys.contains("## Verification") && sys.contains("- build: `cargo build`"), "{sys}");
+        assert!(
+            sys.contains("# Source overview") && sys.contains("println!(\"hi\");"),
+            "small files are inlined in full"
+        );
+        assert!(sys.contains("`read_file`"), "the local tools are explained");
+        assert!(!sys.contains("{{"), "every placeholder is filled");
+    }
+
+    #[test]
+    fn review_prompt_includes_verification() {
+        // A CRLF copy (Windows checkout or editor) renders the same.
+        let t = Template::Review.default_text().replace("\r\n", "\n").replace('\n', "\r\n");
+        let r = build_review_prompt_from(&t, "## Summary\nS", "+a", &[], "- build `cargo build` failed (exit code 101)");
+        assert!(r.contains("# Verification results\n- build `cargo build` failed"), "{r}");
+        assert!(build_review_prompt_from(&t, "S", "+a", &[], "").contains("# Verification results\nNot run."));
     }
 
     #[test]

@@ -81,7 +81,8 @@ fn merge_kwargs(body: &mut Value, key: &str, val: Value) {
     kw.as_object_mut().unwrap().insert(key.to_string(), val);
 }
 
-/// Add the reasoning-control fields for this profile to an OpenAI-style chat request body.
+/// Add the reasoning-control fields for this profile to an OpenAI-style chat request body
+/// (the coder role: as little reasoning as the model allows).
 pub fn apply_request_params(ctrl: &ReasoningControl, body: &mut Value) {
     match ctrl.mode {
         ReasoningMode::DisableThinking => {
@@ -89,9 +90,24 @@ pub fn apply_request_params(ctrl: &ReasoningControl, body: &mut Value) {
         }
         ReasoningMode::Effort => {
             let effort = if ctrl.effort.trim().is_empty() { "low" } else { ctrl.effort.trim() };
-            body.as_object_mut().unwrap().insert("reasoning_effort".into(), json!(effort));
-            merge_kwargs(body, "reasoning_effort", json!(effort));
+            set_effort(body, effort);
         }
+        ReasoningMode::None => {}
+    }
+}
+
+fn set_effort(body: &mut Value, effort: &str) {
+    body.as_object_mut().unwrap().insert("reasoning_effort".into(), json!(effort));
+    merge_kwargs(body, "reasoning_effort", json!(effort));
+}
+
+/// Reasoning fields for the planner role, which thinks before it writes the spec or review:
+/// Qwen3.x get `enable_thinking: true`, effort-controlled models (gpt-oss) get `effort`
+/// (blank → "high"), and profiles that send nothing keep sending nothing.
+pub fn apply_thinking_params(ctrl: &ReasoningControl, body: &mut Value, effort: &str) {
+    match ctrl.mode {
+        ReasoningMode::DisableThinking => merge_kwargs(body, "enable_thinking", json!(true)),
+        ReasoningMode::Effort => set_effort(body, if effort.trim().is_empty() { "high" } else { effort.trim() }),
         ReasoningMode::None => {}
     }
 }
@@ -222,6 +238,29 @@ mod tests {
         let mut body = json!({});
         apply_request_params(&c, &mut body);
         assert_eq!(body["reasoning_effort"], json!("low"));
+    }
+
+    #[test]
+    fn planner_role_turns_thinking_on() {
+        let mut body = json!({"chat_template_kwargs": {"preserve_thinking": false}});
+        apply_thinking_params(&ReasoningControl::qwen(), &mut body, "high");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(true));
+        assert_eq!(body["chat_template_kwargs"]["preserve_thinking"], json!(false));
+        assert!(body.get("reasoning_effort").is_none(), "Qwen has no effort switch");
+
+        let mut body = json!({});
+        apply_thinking_params(&ReasoningControl::gpt_oss(), &mut body, "medium");
+        assert_eq!(body["reasoning_effort"], json!("medium"));
+        assert_eq!(body["chat_template_kwargs"]["reasoning_effort"], json!("medium"));
+        let mut body = json!({});
+        apply_thinking_params(&ReasoningControl::gpt_oss(), &mut body, " ");
+        assert_eq!(body["reasoning_effort"], json!("high"), "blank planner effort means high");
+
+        let mut none = ReasoningControl::qwen();
+        none.mode = ReasoningMode::None;
+        let mut body = json!({"a": 1});
+        apply_thinking_params(&none, &mut body, "high");
+        assert_eq!(body, json!({"a": 1}));
     }
 
     #[test]
