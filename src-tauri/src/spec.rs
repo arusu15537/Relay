@@ -61,6 +61,21 @@ static BACKTICK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`\n]+)`").u
 static ACTION_TAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\((?:modify|create|new|edit|delete|remove|update|new file)\)").unwrap());
 static HEADING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(#{1,6})\s+(.+?)\s*#*\s*$").unwrap());
+static CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z_][\w.]*\s*\(").unwrap());
+static IDENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z_][\w.]*").unwrap());
+
+/// Is this inline code span an implementation (an expression or call chain) rather than a name,
+/// signature, type or literal value? Flags calls nested in calls, calls combined with arithmetic,
+/// `**`, and arithmetic between two or more names. A quantity such as `max_retries + 1` and
+/// signatures with type annotations or defaults are fine.
+pub fn is_code_expression(span: &str) -> bool {
+    let s = span.trim();
+    let annotated = s.contains("->") || s.contains(": ");
+    let arithmetic = [" * ", " + ", " - ", " / ", " % "].iter().any(|op| s.contains(op));
+    let nested_call = !annotated && s.matches('(').count() >= 2;
+    let names = IDENT.find_iter(s).count();
+    nested_call || s.contains("**") || (!annotated && arithmetic && (CALL.is_match(s) || names >= 2))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -166,6 +181,7 @@ pub fn parse_spec(md: &str) -> ParsedSpec {
     let mut fence_lines = 0usize;
     let mut code_blocks = 0usize;
     let mut code_lines = 0usize;
+    let mut expressions: Vec<String> = Vec::new();
 
     let flush_change = |spec: &mut ParsedSpec, cur: &mut Option<(String, Vec<String>)>| {
         if let Some((p, body)) = cur.take() {
@@ -184,6 +200,12 @@ pub fn parse_spec(md: &str) -> ParsedSpec {
             fence_lines = 0;
         } else if in_fence && !line.trim().is_empty() {
             fence_lines += 1;
+        } else if !in_fence {
+            for cap in BACKTICK.captures_iter(line) {
+                if is_code_expression(&cap[1]) && !expressions.iter().any(|e| e == &cap[1]) {
+                    expressions.push(cap[1].to_string());
+                }
+            }
         }
         if !in_fence && let Some(cap) = HEADING.captures(line) {
             let level = cap[1].len();
@@ -277,6 +299,15 @@ pub fn parse_spec(md: &str) -> ParsedSpec {
         spec.warnings.push(format!(
             "The spec contains code ({code_lines} lines in {code_blocks} block(s)). Specs describe the design (types, responsibilities, signatures, \
              relationships, contracts); the local model writes all of the code. Remove the code or regenerate the spec."
+        ));
+    }
+    if !expressions.is_empty() {
+        let shown: Vec<String> = expressions.iter().take(3).map(|e| format!("`{e}`")).collect();
+        spec.warnings.push(format!(
+            "The spec writes {} expression(s) in code syntax ({}{}). Specs state rules in words; the local model writes the code.",
+            expressions.len(),
+            shown.join(", "),
+            if expressions.len() > 3 { ", …" } else { "" }
         ));
     }
     if spec.files.is_empty() {
@@ -492,6 +523,40 @@ Export it.
         // Code is still flagged, also inside the Design section.
         let with_code = DESIGN_SPEC.replace("```mermaid\nclassDiagram", "```python\nclass RetryPolicy:");
         assert!(parse_spec(&with_code).warnings.iter().any(|w| w.contains("contains code")));
+    }
+
+    #[test]
+    fn expressions_in_code_syntax_are_flagged() {
+        // Real leaks from a Claude spec (2026-11-15) ...
+        for e in [
+            "min(self.max_backoff, self.backoff_factor * 2 ** attempt)",
+            "self._sleep(self._backoff_delay(attempt))",
+            "sleep(base_delay * 2 ** counter)",
+            "delay * factor",
+            "len(items) - 1",
+        ] {
+            assert!(is_code_expression(e), "{e}");
+        }
+        // ... and what a design spec legitimately writes inline.
+        for ok in [
+            "max_retries + 1",
+            "__init__(self, base_url: str, timeout: float = 10, sleep: Callable[[float], None] = time.sleep) -> None",
+            "retry_with_backoff(fn, retries=3, base_delay=0.5, should_retry=lambda exc: True, sleep=time.sleep)",
+            "frozenset({429, 500, 502, 503, 504})",
+            "RETRY_STATUSES: frozenset[int]",
+            "urllib.error.HTTPError",
+            "_backoff_delay(self, retry_number: int) -> float",
+            "Content-Type: application/json",
+            "0.5, 1.0, 2.0",
+        ] {
+            assert!(!is_code_expression(ok), "{ok}");
+        }
+        let s = parse_spec("## Files\n- `a.py` (modify)\n## Changes\n### `a.py`\nWait `self._sleep(self._backoff_delay(n))` between at most `max_retries + 1` attempts.\n");
+        assert!(
+            s.warnings.iter().any(|w| w.contains("1 expression(s) in code syntax (`self._sleep(self._backoff_delay(n))`)")),
+            "{:?}",
+            s.warnings
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ Output ONLY the spec, in Markdown, with exactly these top-level sections in this
 The design at class-diagram level. This section is sent with every implementation call, so it is the shared contract between files.
 - **Elements:** every class, interface, enum, record or module-level function group that is added or changed, and every existing one the change relies on. For each: its kind, its single responsibility in one sentence, its attributes (`name: type`), and its operations as full signatures written inline with parameter types, defaults and return types, e.g. `fetch(path: str, timeout: float | None = None) -> Response`. Mark what is new, changed or removed.
 - **Relationships:** inheritance or interface implementation, composition and ownership, associations, and which element depends on which (keep dependencies pointing one way: core logic must not depend on UI, I/O or frameworks). Say which element creates which and who calls whom.
-- **Contracts:** for each operation that matters, what it guarantees: inputs it accepts, what it returns, errors it raises and when, side effects, invariants it keeps. Describe what must hold, not how to achieve it.
+- **Contracts:** for each operation that matters, what it guarantees: inputs it accepts, what it returns, errors it raises and when, side effects, invariants it keeps. Describe in words what must hold, not how to achieve it.
 - **Decisions:** 2–5 bullets, each a design choice, why it fits this codebase, and the alternative you rejected. Consider where each responsibility belongs (next to the data it uses), reusing the codebase's existing types and patterns before adding new ones, composition over inheritance, making invalid states unrepresentable with types or enums instead of loose flags, and extension points only where variation is real. Name a design pattern only when it earns its place; never add layers the instruction does not need.
 - Optionally, when several elements relate to each other, add one Mermaid `classDiagram` block summarizing them (classes, members with signatures, relationships). No other fenced blocks anywhere in the spec.
 
@@ -48,7 +48,7 @@ Bullets: each edge case and the behaviour required for it (what must happen, not
 Bullets: concrete, checkable criteria (observable behaviour, tests that must pass, structure that must hold, things that must not change).
 
 Rules:
-- Do not write the implementation. No code, no function bodies, no pseudo-code, no step-by-step algorithms or control flow: the implementing model writes all of the code and chooses how each operation works. Use inline `code` only for names, signatures, types, literal values and short expressions.
+- Do not write the implementation. No code, no function bodies, no pseudo-code, no step-by-step algorithms or control flow: the implementing model writes all of the code and chooses how each operation works. Use inline `code` only for names, signatures, types and literal values. Never write expressions, formulas or call chains in code syntax (such as `min(a, b * 2 ** n)` or `self.f(self.g(x))`); when a value must follow a rule, state the rule as a requirement in words (e.g. "the delay starts at `backoff_factor` seconds, doubles after each failed attempt and never exceeds `max_backoff`").
 - No preamble, questions or commentary outside these sections.
 - Do not expand the scope beyond the instruction. Follow the existing architecture, code style and conventions.
 - Do not tell the implementing model how to format its output; the pipeline handles that.

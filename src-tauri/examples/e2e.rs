@@ -82,7 +82,7 @@ Create the file. It imports `time` and defines one function:
 `retry_with_backoff(fn, retries=3, base_delay=0.5, should_retry=lambda exc: True, sleep=time.sleep)`.
 1. Give it a docstring saying it calls `fn()` and retries retryable exceptions with exponential backoff, making at most `retries + 1` calls.
 2. Keep an attempt counter starting at 0. In a loop, call `fn()` and return its result if it succeeds.
-3. If `fn()` raises an `Exception`: re-raise that same exception unchanged when the counter is already equal to or greater than `retries`, or when `should_retry(exc)` is False. Otherwise call `sleep(base_delay * 2 ** counter)`, increase the counter by 1, and loop again.
+3. If `fn()` raises an `Exception`: re-raise that same exception unchanged when the counter is already equal to or greater than `retries`, or when `should_retry(exc)` is False. Otherwise call `sleep` with a delay of `base_delay` seconds doubled once for every earlier retry (0.5, 1.0, 2.0, … with the defaults), increase the counter by 1, and loop again.
 4. Exceptions that are not subclasses of `Exception` (e.g. `KeyboardInterrupt`) are not caught.
 
 ## Edge cases
@@ -852,7 +852,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                     );
                     c.check(
                         ex.parsed.warnings.is_empty(),
-                        format!("spec structure ok, no code: {:?}", ex.parsed.warnings),
+                        format!("spec structure ok, no code or code-syntax expressions: {:?}", ex.parsed.warnings),
                     );
                     c.check(
                         ex.parsed.design.contains('(') && ex.parsed.design.lines().count() >= 3,
@@ -880,10 +880,20 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                         core.accept_file("run-claude", &f.path, None, false).unwrap();
                     }
                     match core.review("run-claude", "review-1").await {
-                        Ok(rv) => c.check(
-                            !rv.verdict.is_empty(),
-                            format!("review verdict: {} (follow-up spec: {})", rv.verdict, rv.follow_up_spec.is_some()),
-                        ),
+                        Ok(rv) => {
+                            c.check(
+                                !rv.verdict.is_empty(),
+                                format!("review verdict: {} (follow-up spec: {})", rv.verdict, rv.follow_up_spec.is_some()),
+                            );
+                            if let Some(f) = &rv.follow_up_spec {
+                                println!("--- follow-up spec ---\n{f}\n---");
+                                let parsed = relay_lib::spec::parse_spec(f);
+                                c.check(
+                                    parsed.warnings.is_empty() && !parsed.design.is_empty(),
+                                    format!("follow-up spec is design-level, no code: {:?}", parsed.warnings),
+                                );
+                            }
+                        }
                         Err(e) => c.check(false, format!("review failed: {e}")),
                     }
                 }
