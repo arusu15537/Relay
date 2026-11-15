@@ -102,6 +102,9 @@ pub struct Prepared {
     pub files: Vec<PreparedFile>,
     pub budget: BudgetPlan,
     pub warnings: Vec<String>,
+    /// The commands a run will verify the change with (filled in for the UI).
+    #[serde(default)]
+    pub verify: Option<crate::verify::VerifyPreview>,
     /// Text sent to the model per file: targets in full, context files in full or as an outline.
     #[serde(skip)]
     contents: Vec<(String, Option<String>)>,
@@ -144,6 +147,9 @@ pub struct CallReport {
     pub target: Option<String>,
     pub attempts: Vec<AttemptReport>,
     pub ok: bool,
+    /// What the call was for, when not the first implementation pass ("Fix round 1", "Follow-up").
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +168,9 @@ pub struct ImplementResult {
     pub warnings: Vec<String>,
     pub duration_ms: u64,
     pub avg_tok_per_sec: Option<f64>,
+    /// Staging, verification, fix rounds and review (absent for a plain implementation run).
+    #[serde(default)]
+    pub workflow: Option<crate::workflow::WorkflowReport>,
 }
 
 pub fn lang_for(path: &str) -> &'static str {
@@ -203,7 +212,16 @@ pub fn prepare(
     profile: &Profile,
     system_prompt: &str,
 ) -> Prepared {
-    prepare_with(root, spec_text, context_files, opts, profile, system_prompt, &estimate_tokens, false)
+    prepare_with(
+        root,
+        spec_text,
+        context_files,
+        opts,
+        profile,
+        system_prompt,
+        &estimate_tokens,
+        false,
+    )
 }
 
 /// [`prepare`] with a token counter: `count` gives the size of each text sent to the model
@@ -332,6 +350,7 @@ pub fn prepare_with(
         files,
         budget,
         warnings,
+        verify: None,
         contents,
     }
 }
@@ -453,10 +472,7 @@ pub const MIN_PRIME_BYTES: usize = 2000;
 ///   process when the run starts.
 pub fn prime_points(prep: &Prepared, spec_text: &str, mode: SplitMode, system_prompt: &str, through_files: bool) -> Vec<PrimePoint> {
     let calls = plan_calls(prep, spec_text, mode);
-    let messages: Vec<UserMessage> = calls
-        .iter()
-        .map(|c| user_message(&c.spec_text, &c.targets, &c.context))
-        .collect();
+    let messages: Vec<UserMessage> = calls.iter().map(|c| user_message(&c.spec_text, &c.targets, &c.context)).collect();
     let Some(first) = messages.first() else {
         return vec![];
     };
@@ -599,6 +615,7 @@ pub async fn implement_prepared(ctx: &RunContext<'_>, req: &ImplementRequest, pr
         warnings: prep.warnings.clone(),
         duration_ms: 0,
         avg_tok_per_sec: None,
+        workflow: None,
     };
     let calls = plan_calls(&prep, &req.spec, mode);
     if calls.iter().all(|c| c.targets.is_empty()) && prep.spec.files.is_empty() {
@@ -639,6 +656,7 @@ pub async fn implement_prepared(ctx: &RunContext<'_>, req: &ImplementRequest, pr
                     ..Default::default()
                 }],
                 ok: false,
+                label: None,
             });
             ev(&ctx.sink, &req.run_id, "callEnd", json!({ "call": i, "ok": false, "error": msg }));
             all_ok = false;
@@ -694,28 +712,70 @@ async fn run_call(
     source: &ProjectSource,
     ws: &mut Workspace,
 ) -> CallReport {
+    let messages = vec![
+        ChatMessage::system(ctx.system_prompt.clone()),
+        ChatMessage::user(build_user_message(&call.spec_text, &call.targets, &call.context)),
+    ];
+    let required: Vec<String> = call.targets.iter().map(|(p, _)| p.clone()).collect();
+    run_edit_call(
+        ctx,
+        &EditCall {
+            run_id: &req.run_id,
+            index,
+            target: call.target.clone(),
+            label: None,
+            messages,
+            required,
+            allowed: call.allowed.clone(),
+        },
+        source,
+        ws,
+    )
+    .await
+}
+
+/// One local-model edit request: the messages to send, which files must receive an edit, which
+/// may be edited (`None` = any file inside the source's root).
+pub struct EditCall<'a> {
+    pub run_id: &'a str,
+    pub index: usize,
+    pub target: Option<String>,
+    pub label: Option<String>,
+    pub messages: Vec<ChatMessage>,
+    pub required: Vec<String>,
+    pub allowed: Option<Vec<String>>,
+}
+
+/// Send an edit request, apply the SEARCH/REPLACE blocks to `ws`, and retry once with the errors
+/// if any block fails, a required file got no edit, or the reply was cut off.
+pub async fn run_edit_call(
+    ctx: &RunContext<'_>,
+    call: &EditCall<'_>,
+    source: &(dyn crate::editformat::FileSource + Sync),
+    ws: &mut Workspace,
+) -> CallReport {
+    let index = call.index;
+    let run_id = call.run_id;
     let mut report = CallReport {
         index,
         target: call.target.clone(),
         attempts: vec![],
         ok: false,
+        label: call.label.clone(),
     };
-    let mut messages = vec![
-        ChatMessage::system(ctx.system_prompt.clone()),
-        ChatMessage::user(build_user_message(&call.spec_text, &call.targets, &call.context)),
-    ];
-    let required: Vec<String> = call.targets.iter().map(|(p, _)| p.clone()).collect();
+    let mut messages = call.messages.clone();
+    let required = &call.required;
 
     for attempt in 1..=2u32 {
         ev(
             &ctx.sink,
-            &req.run_id,
+            run_id,
             "callStart",
-            json!({ "call": index, "target": call.target, "attempt": attempt }),
+            json!({ "call": index, "target": call.target, "attempt": attempt, "label": call.label }),
         );
         let body = build_body(ctx.profile, &ctx.endpoint.model, &messages, ctx.profile.max_output_tokens);
         let sink = ctx.sink.clone();
-        let run_id = req.run_id.clone();
+        let rid = run_id.to_string();
         let mut buf = String::new();
         let mut rbuf = String::new();
         let mut last_flush = Instant::now();
@@ -729,7 +789,7 @@ async fn run_call(
                 if !buf.is_empty() {
                     ev(
                         &sink,
-                        &run_id,
+                        &rid,
                         "delta",
                         json!({ "call": index, "attempt": attempt, "text": std::mem::take(&mut buf) }),
                     );
@@ -737,7 +797,7 @@ async fn run_call(
                 if !rbuf.is_empty() {
                     ev(
                         &sink,
-                        &run_id,
+                        &rid,
                         "reasoningDelta",
                         json!({ "call": index, "attempt": attempt, "text": std::mem::take(&mut rbuf) }),
                     );
@@ -747,7 +807,7 @@ async fn run_call(
             if last_stats.elapsed().as_millis() >= 300 {
                 ev(
                     &sink,
-                    &run_id,
+                    &rid,
                     "stats",
                     json!({ "call": index, "tokens": stats.tokens, "tokPerSec": stats.tok_per_sec, "elapsedMs": stats.elapsed_ms }),
                 );
@@ -758,7 +818,7 @@ async fn run_call(
         if !buf.is_empty() {
             ev(
                 &ctx.sink,
-                &req.run_id,
+                run_id,
                 "delta",
                 json!({ "call": index, "attempt": attempt, "text": buf }),
             );
@@ -766,7 +826,7 @@ async fn run_call(
         if !rbuf.is_empty() {
             ev(
                 &ctx.sink,
-                &req.run_id,
+                run_id,
                 "reasoningDelta",
                 json!({ "call": index, "attempt": attempt, "text": rbuf }),
             );
@@ -777,7 +837,7 @@ async fn run_call(
                 let msg = e.to_string();
                 ev(
                     &ctx.sink,
-                    &req.run_id,
+                    run_id,
                     "callEnd",
                     json!({ "call": index, "attempt": attempt, "ok": false, "error": msg }),
                 );
@@ -798,7 +858,7 @@ async fn run_call(
             });
             ev(
                 &ctx.sink,
-                &req.run_id,
+                run_id,
                 "callEnd",
                 json!({ "call": index, "attempt": attempt, "ok": false, "error": "cancelled" }),
             );
@@ -865,7 +925,7 @@ async fn run_call(
         };
         ev(
             &ctx.sink,
-            &req.run_id,
+            run_id,
             "callEnd",
             json!({ "call": index, "attempt": attempt, "ok": ok, "blocks": parsed.blocks.len(), "failed": outcomes.iter().filter(|o| !o.ok).count(),
                     "issues": issues.len(), "missing": missing, "tokPerSec": outcome.tok_per_sec, "completionTokens": outcome.completion_tokens,
@@ -899,7 +959,7 @@ async fn run_call(
         if used + estimate_tokens(&msg) + ctx.profile.max_output_tokens + ctx.profile.reasoning.reasoning_reserve > limit {
             msg = retry_message(&outcomes, &parsed.blocks, &issues, ws, false);
         }
-        ev(&ctx.sink, &req.run_id, "retry", json!({ "call": index, "message": msg }));
+        ev(&ctx.sink, run_id, "retry", json!({ "call": index, "message": msg }));
         messages.push(ChatMessage::assistant(stripped.content));
         messages.push(ChatMessage::user(msg));
     }
@@ -1011,7 +1071,10 @@ mod tests {
             .collect();
         let files_at = msgs[0].find("# Files to edit").unwrap();
         let shared = &msgs[0][..files_at];
-        assert!(shared.contains("## `util.py` (outline)") && shared.contains("## `notes.md`"), "{shared}");
+        assert!(
+            shared.contains("## `util.py` (outline)") && shared.contains("## `notes.md`"),
+            "{shared}"
+        );
         assert!(
             common_prefix(&msgs[0], &msgs[1]) > files_at,
             "the second call must reuse the whole context section"
@@ -1044,7 +1107,8 @@ mod tests {
         let c = calls[0].context.iter().find(|c| c.path == "util.py").unwrap();
         assert!(c.outline);
         assert!(
-            c.text.contains("def helper_3(value: int) -> int:\n    \"\"\"Helper 3.\"\"\"\n    # … (4 lines omitted)\n"),
+            c.text
+                .contains("def helper_3(value: int) -> int:\n    \"\"\"Helper 3.\"\"\"\n    # … (4 lines omitted)\n"),
             "{}",
             c.text
         );
@@ -1092,7 +1156,10 @@ mod tests {
         let u = p.files.iter().find(|f| f.path == "util.py").unwrap();
         assert!(u.tokens < OUTLINE_MIN_TOKENS && u.outline_tokens.is_none());
         let n = p.files.iter().find(|f| f.path == "notes.md").unwrap();
-        assert!(n.tokens > OUTLINE_MIN_TOKENS && n.outline_tokens.is_none(), "markdown has no outline");
+        assert!(
+            n.tokens > OUTLINE_MIN_TOKENS && n.outline_tokens.is_none(),
+            "markdown has no outline"
+        );
     }
 
     #[test]
@@ -1110,15 +1177,25 @@ mod tests {
             true,
         );
         let a = p.files.iter().find(|f| f.path == "a.py").unwrap();
-        assert_eq!(a.tokens, words("def a():
+        assert_eq!(
+            a.tokens,
+            words(
+                "def a():
     return 1
-"));
+"
+            )
+        );
         assert!(p.budget.exact);
         let est = prep(&d, &[], &ContextOptions::default());
         assert!(!est.budget.exact);
-        assert_eq!(est.files.iter().find(|f| f.path == "a.py").unwrap().tokens, estimate_tokens("def a():
+        assert_eq!(
+            est.files.iter().find(|f| f.path == "a.py").unwrap().tokens,
+            estimate_tokens(
+                "def a():
     return 1
-"));
+"
+            )
+        );
     }
 
     #[test]
@@ -1149,13 +1226,19 @@ mod tests {
         let second = build_user_message(&calls[1].spec_text, &calls[1].targets, &calls[1].context);
 
         let pts = prime_points(&p, SPEC, SplitMode::PerFile, "sys", true);
-        assert_eq!(pts.iter().map(|x| x.label).collect::<Vec<_>>(), vec!["shared context", "context and files"]);
+        assert_eq!(
+            pts.iter().map(|x| x.label).collect::<Vec<_>>(),
+            vec!["shared context", "context and files"]
+        );
         let shared = &pts[0];
         let text = &shared.messages[1].content;
         assert_eq!(shared.messages[0].content, "sys");
         assert!(text[..shared.cut].contains("## `util.py`") && !text[..shared.cut].contains("# Files to edit"));
         assert!(text[..shared.cut].ends_with('\n'));
-        assert!(second.starts_with(&text[..shared.cut]), "the second call starts with the primed prefix");
+        assert!(
+            second.starts_with(&text[..shared.cut]),
+            "the second call starts with the primed prefix"
+        );
         let files = &pts[1];
         assert!(files.messages[1].content[files.cut..].starts_with("# Specification"));
 

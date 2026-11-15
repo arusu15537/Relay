@@ -11,14 +11,18 @@ pub mod llm;
 pub mod outline;
 pub mod pathsafe;
 pub mod pipeline;
+pub mod planner;
 pub mod prewarm;
 pub mod project;
 pub mod reasoning;
 pub mod server;
 pub mod spec;
+pub mod staging;
 pub mod templates;
 pub mod tokens;
+pub mod verify;
 pub mod winproc;
+pub mod workflow;
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager, RunEvent};

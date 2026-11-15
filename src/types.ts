@@ -5,6 +5,9 @@ export type PaneStatus = "idle" | "running" | "done" | "error";
 export type SplitMode = "single" | "perFile";
 export type ProfileKind = "managed" | "external";
 export type ClaudeBackend = "cli" | "api";
+export type PlannerBackend = "local" | "claude";
+export type VerifyKind = "setup" | "build" | "test" | "run";
+export type StepKind = "stage" | "implement" | "verify" | "fix" | "review" | "followUp";
 export type ReasoningMode = "disable_thinking" | "effort" | "none";
 export type FileAction = "modify" | "create" | "delete";
 
@@ -46,6 +49,8 @@ export interface Profile {
   contextLimit: number;
   maxOutputTokens: number;
   sampling: Sampling;
+  /** Sampling for the planner role (thinking on); null → `sampling`. */
+  thinkingSampling: Sampling | null;
   reasoning: ReasoningControl;
   external: ExternalEndpoint;
 }
@@ -55,6 +60,18 @@ export interface Settings {
   llamaServerPath: string;
   serverPort: number;
   activeProfile: string;
+  plannerBackend: PlannerBackend;
+  plannerProfile: string;
+  plannerEffort: string;
+  plannerTools: boolean;
+  coderProfile: string;
+  verifyEnabled: boolean;
+  maxFixRounds: number;
+  loopReview: boolean;
+  followUpRounds: number;
+  buildTimeoutSecs: number;
+  runTimeoutSecs: number;
+  autopilot: boolean;
   claudeBackend: ClaudeBackend;
   claudeModel: string;
   claudeEffort: string;
@@ -129,7 +146,60 @@ export interface ParsedSpec {
   edgeCases: string;
   acceptance: string;
   mentionedPaths: string[];
+  verification?: VerifyCommand[];
+  verificationDeclared?: boolean;
   warnings: string[];
+}
+
+export interface VerifyCommand {
+  kind: VerifyKind;
+  command: string;
+  timeoutSecs: number | null;
+  expect: string | null;
+}
+
+export interface VerifyPreview {
+  enabled: boolean;
+  commands: VerifyCommand[];
+  /** "spec", "detected" or "off". */
+  source: string;
+  detectedFrom: string[];
+  warnings: string[];
+}
+
+export interface CommandResult {
+  kind: VerifyKind | null;
+  command: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  cancelled: boolean;
+  passed: boolean;
+  durationMs: number;
+  output: string;
+  expectMissing: boolean;
+  spawnError: string | null;
+}
+
+export interface WorkflowStep {
+  kind: StepKind;
+  label: string;
+  ok: boolean;
+  durationMs: number;
+  detail: string;
+  commands: CommandResult[];
+  review: Review | null;
+}
+
+export interface WorkflowReport {
+  stagingDir: string;
+  planner: string;
+  coder: string;
+  commands: VerifyCommand[];
+  commandsSource: string;
+  steps: WorkflowStep[];
+  verified: boolean | null;
+  review: Review | null;
+  outcome: string;
 }
 
 export interface CallBudget {
@@ -171,6 +241,8 @@ export interface Prepared {
   files: PreparedFile[];
   budget: BudgetPlan;
   warnings: string[];
+  /** What the run will verify (missing in older builds). */
+  verify?: VerifyPreview | null;
 }
 
 export interface ClaudeResult {
@@ -184,6 +256,9 @@ export interface ClaudeResult {
   /** Prompt tokens read from Claude's prompt cache (all turns of the expansion). */
   cacheReadTokens?: number | null;
   cacheWriteTokens?: number | null;
+  /** Local planner: generation speed and the tool calls it made. */
+  tokPerSec?: number | null;
+  toolCalls?: string[];
 }
 
 export interface ExpandResult {
@@ -237,6 +312,8 @@ export interface CallReport {
   target: string | null;
   attempts: AttemptReport[];
   ok: boolean;
+  /** "Fix 1", "Follow-up 1"; null for the first implementation pass. */
+  label?: string | null;
 }
 
 export interface ProposedFile {
@@ -259,6 +336,8 @@ export interface ImplementResult {
   warnings: string[];
   durationMs: number;
   avgTokPerSec: number | null;
+  /** Staging, verification, fix rounds and review (absent for plain runs). */
+  workflow?: WorkflowReport | null;
 }
 
 export interface ImplementResponse {
@@ -395,7 +474,27 @@ export interface LlamaRelease {
 
 export interface RunEvent {
   runId: string;
-  kind: "start" | "callStart" | "delta" | "reasoningDelta" | "stats" | "callEnd" | "retry" | "done" | "primed";
+  kind:
+    | "start"
+    | "callStart"
+    | "delta"
+    | "reasoningDelta"
+    | "stats"
+    | "callEnd"
+    | "retry"
+    | "done"
+    | "primed"
+    | "phase"
+    | "stepEnd"
+    | "cmdStart"
+    | "cmdOutput"
+    | "cmdEnd"
+    | "reviewDelta"
+    | "reviewReasoning"
+    | "reviewTool"
+    | "reviewSegment"
+    | "reviewStats"
+    | "reviewStatus";
   call?: number;
   attempt?: number;
   text?: string;
@@ -412,6 +511,16 @@ export interface RunEvent {
   cached?: number | null;
   processed?: number | null;
   ms?: number;
+  /** Loop events: the step, a command, its outcome. */
+  step?: StepKind | VerifyKind;
+  command?: string;
+  passed?: boolean;
+  exitCode?: number | null;
+  timedOut?: boolean;
+  durationMs?: number;
+  summary?: string;
+  detail?: string;
+  timeoutSecs?: number;
 }
 
 export interface PrimeOutcome {

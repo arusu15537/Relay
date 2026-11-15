@@ -1,7 +1,7 @@
 //! Application core shared by the Tauri commands and the headless e2e harness.
 
 use crate::budget::{SplitMode, estimate_tokens};
-use crate::claude::{self, ClaudeCall, ClaudeResult, ExpandInputs, Review};
+use crate::claude::{self, ClaudeCall, ClaudeResult, ExpandInputs, Explore, Review};
 use crate::config::{self, Profile, ProfileKind, Settings, builtin_profiles};
 use crate::editformat::{Workspace, parse_blocks};
 use crate::events::Sink;
@@ -418,7 +418,7 @@ impl AppCore {
     /// to it instead of processing it again. Skipped when a spec-review prewarm already primed
     /// exactly this run (priming again would discard its deeper checkpoint).
     #[allow(clippy::too_many_arguments)]
-    async fn prime_shared_context(
+    pub(crate) async fn prime_shared_context(
         &self,
         run_id: &str,
         profile: &Profile,
@@ -434,7 +434,8 @@ impl AppCore {
         {
             return;
         }
-        self.prime_points_for_run(run_id, profile, endpoint, prep, spec, cancel, &system).await;
+        self.prime_points_for_run(run_id, profile, endpoint, prep, spec, cancel, &system)
+            .await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -561,23 +562,57 @@ impl AppCore {
         if req.instruction.trim().is_empty() {
             bail!("Type an instruction first");
         }
-        let explore = settings.claude_cli_explore && settings.claude_backend == config::ClaudeBackend::Cli;
+        let local = settings.planner_backend == config::PlannerBackend::Local;
+        let explore = if local {
+            if settings.planner_tools {
+                Explore::LocalTools
+            } else {
+                Explore::None
+            }
+        } else if settings.claude_cli_explore && settings.claude_backend == config::ClaudeBackend::Cli {
+            Explore::ClaudeTools
+        } else {
+            Explore::None
+        };
+        // The local planner gets a source overview in its prompt (Claude reads files with tools).
+        let outline_budget = if local {
+            self.profile(&settings.planner_profile)
+                .map(|p| (p.context_limit / 5).min(12_000))
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let (prompt, warnings) = claude::build_expand_prompt(&ExpandInputs {
             instruction: &req.instruction,
             root: &root,
             context_files: &req.context_files,
             profile: &profile,
             explore,
+            outline_budget,
         })?;
         let cancel = self.register_job(&req.job_id);
-        let call = ClaudeCall {
-            job_id: &req.job_id,
-            system: prompt.system,
-            prompt: prompt.prompt,
-            cwd: Some(root.clone()),
-            allow_read_tools: explore,
+        let res = if local {
+            let _guard = self.run_lock.lock().await;
+            crate::workflow::planner_answer(
+                self,
+                &settings,
+                prompt.system,
+                prompt.prompt,
+                &root,
+                crate::workflow::EventTarget::Job(&req.job_id),
+                &cancel,
+            )
+            .await
+        } else {
+            let call = ClaudeCall {
+                job_id: &req.job_id,
+                system: prompt.system,
+                prompt: prompt.prompt,
+                cwd: Some(root.clone()),
+                allow_read_tools: explore == Explore::ClaudeTools,
+            };
+            claude::run(&settings, call, &self.sink, &cancel, &self.stream_http).await
         };
-        let res = claude::run(&settings, call, &self.sink, &cancel, &self.stream_http).await;
         self.finish_job(&req.job_id);
         let res = res?;
         let spec = claude::clean_spec(&res.text);
@@ -684,7 +719,7 @@ impl AppCore {
         (!self.tokens.is_unsupported(&key)).then_some(key)
     }
 
-    fn context_options(&self, full_context: &[String]) -> ContextOptions {
+    pub(crate) fn context_options(&self, full_context: &[String]) -> ContextOptions {
         ContextOptions {
             outlines: self.settings().outline_context,
             full: full_context.to_vec(),
@@ -718,6 +753,24 @@ impl AppCore {
                 return Err(e);
             }
         };
+        let plan = crate::workflow::plan(self, &settings, &cmd.spec, Path::new(&cmd.project_root));
+        if !plan.is_plain() {
+            let input = crate::workflow::Input {
+                run_id: &run_id,
+                project_root: Path::new(&cmd.project_root),
+                spec: &cmd.spec,
+                context_files: &cmd.context_files,
+                full_context: &cmd.full_context,
+                mode: cmd.mode,
+                coder: &profile,
+                cancel: &cancel,
+                prewarmed,
+            };
+            let result = crate::workflow::run(self, input, plan).await;
+            self.finish_job(&run_id);
+            let result = result?;
+            return self.finish_implement(&cmd, &settings, &profile, result);
+        }
         let ctx = RunContext {
             sink: self.sink.clone(),
             http: self.stream_http.clone(),
@@ -750,6 +803,17 @@ impl AppCore {
         }
         let result = pipeline::implement_prepared(&ctx, &req, prep).await;
         self.finish_job(&run_id);
+        self.finish_implement(&cmd, &settings, &profile, result)
+    }
+
+    /// Record a run in the history and decide whether to suggest the fallback model.
+    fn finish_implement(
+        &self,
+        cmd: &ImplementCommand,
+        settings: &Settings,
+        profile: &Profile,
+        result: ImplementResult,
+    ) -> Result<ImplementResponse> {
         let model_file = match profile.kind {
             ProfileKind::Managed => profile
                 .resolved_gguf(Path::new(&settings.models_dir))
@@ -758,6 +822,9 @@ impl AppCore {
             ProfileKind::External => format!("{} ({})", profile.external.base_url, profile.external.model),
         };
         self.history.save_run(&cmd.job_id, &cmd.spec, &model_file, &result)?;
+        if let Some(rv) = result.workflow.as_ref().and_then(|w| w.review.as_ref()) {
+            self.history.save_review(&result.run_id, &serde_json::to_value(rv)?)?;
+        }
         let fallback_suggested = !result.validation_ok
             && !result.cancelled
             && settings.auto_fallback
@@ -826,17 +893,26 @@ impl AppCore {
         if after_chars > 200_000 {
             after.clear(); // the diff alone; Claude CLI can still read files with tools
         }
-        let prompt = claude::build_review_prompt(&spec, &diff, &after);
-        let explore = settings.claude_cli_explore && settings.claude_backend == config::ClaudeBackend::Cli;
+        let prompt = claude::build_review_prompt(
+            &spec,
+            &diff,
+            &after,
+            "Not run for this review (the accepted files are reviewed in the project).",
+        );
         let cancel = self.register_job(job_id_for_events);
-        let call = ClaudeCall {
-            job_id: job_id_for_events,
-            system: None,
-            prompt,
-            cwd: Some(PathBuf::from(&root)),
-            allow_read_tools: explore,
+        let res = {
+            let _guard = self.run_lock.lock().await;
+            crate::workflow::planner_answer(
+                self,
+                &settings,
+                None,
+                prompt,
+                Path::new(&root),
+                crate::workflow::EventTarget::Job(job_id_for_events),
+                &cancel,
+            )
+            .await
         };
-        let res = claude::run(&settings, call, &self.sink, &cancel, &self.stream_http).await;
         self.finish_job(job_id_for_events);
         let res = res?;
         if res.cancelled {

@@ -1,9 +1,90 @@
 import { DiffEditor } from "@monaco-editor/react";
 import { useEffect, useMemo, useState } from "react";
-import { acceptAll, acceptFile, applyFollowUp, cancelRun, implement, rejectFile, review, setEdited } from "../actions";
-import { fmtSecs } from "../api";
+import { acceptAll, acceptFile, applyFollowUp, cancelRun, implement, plannerName, rejectFile, review, setEdited } from "../actions";
+import { api, fmtSecs } from "../api";
 import { RunView, set, useStore } from "../store";
-import type { AttemptReport, CallReport } from "../types";
+import type { AttemptReport, CallReport, CommandResult, WorkflowReport } from "../types";
+
+const STEP_ICON: Record<string, string> = { stage: "⧉", implement: "✎", verify: "▶", fix: "🔧", review: "🔍", followUp: "↻" };
+
+function StepList({ steps }: { steps: RunView["steps"] }) {
+  return (
+    <ol className="steps">
+      {steps.map((s, i) => (
+        <li key={i} className={s.ok ? "ok" : "bad"}>
+          <span className="icon" aria-hidden>
+            {STEP_ICON[s.kind] ?? "•"}
+          </span>
+          <b>{s.label}</b>
+          <span className={s.ok ? "okmark" : "badmark"}>{s.ok ? "✓" : "✗"}</span>
+          <span className="faint">{s.detail}</span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function CommandOutput({ c }: { c: CommandResult }) {
+  const tail = c.output.length > 12000 ? `… (${c.output.length - 12000} characters omitted)\n${c.output.slice(-12000)}` : c.output;
+  return (
+    <details className="cmd">
+      <summary>
+        <span style={{ color: c.passed ? "var(--ok)" : "var(--err)" }}>{c.passed ? "✓" : "✗"}</span> <b>{c.kind}</b> <span className="mono">{c.command}</span>{" "}
+        <span className="faint">
+          {c.spawnError
+            ? `could not start: ${c.spawnError}`
+            : c.cancelled
+              ? "cancelled"
+              : c.timedOut
+                ? c.passed
+                  ? "still running at the timeout (ok)"
+                  : "timed out"
+                : `exit ${c.exitCode ?? "?"}`}
+          {c.expectMissing ? " · expected text missing" : ""} · {fmtSecs(c.durationMs)}
+        </span>
+      </summary>
+      <pre>{tail || "(no output)"}</pre>
+    </details>
+  );
+}
+
+function WorkflowPanel({ w }: { w: WorkflowReport }) {
+  const good = w.verified !== false && (!w.review || w.review.passed);
+  return (
+    <div className={`note ${good ? "ok" : "warn"}`}>
+      <div className="row wrap">
+        <b>{w.outcome || "Loop finished"}</b>
+        <span className="faint" style={{ fontSize: 12 }}>
+          planner {w.planner} · coder {w.coder}
+        </span>
+        <span style={{ flex: 1 }} />
+        {w.stagingDir && (
+          <button className="small ghost" onClick={() => api.openInExplorer(w.stagingDir)} title={w.stagingDir}>
+            Open staging copy
+          </button>
+        )}
+      </div>
+      <StepList steps={w.steps.map((s) => ({ kind: s.kind, label: s.label, ok: s.ok, detail: s.detail }))} />
+      {w.steps
+        .filter((s) => s.commands.length > 0)
+        .map((s, i) => (
+          <div key={i} className="col" style={{ gap: 2 }}>
+            <span className="faint" style={{ fontSize: 12 }}>
+              {s.label}
+            </span>
+            {s.commands.map((c, j) => (
+              <CommandOutput key={j} c={c} />
+            ))}
+          </div>
+        ))}
+      {w.commands.length === 0 && (
+        <span className="faint" style={{ fontSize: 12 }}>
+          No verification commands ({w.commandsSource === "off" ? "verification is off" : "nothing to run for this project or spec"}).
+        </span>
+      )}
+    </div>
+  );
+}
 import { langFor, StatusDot, useDarkMode } from "./common";
 
 function Live({ run }: { run: RunView }) {
@@ -12,6 +93,8 @@ function Live({ run }: { run: RunView }) {
     const t = setInterval(() => setNow(Date.now()), 500);
     return () => clearInterval(t);
   }, []);
+  const verifying = run.phase === "verify";
+  const reviewing = run.phase === "review";
   return (
     <>
       <div className="stats">
@@ -28,24 +111,47 @@ function Live({ run }: { run: RunView }) {
           elapsed <b>{fmtSecs(now - run.startedAt)}</b>
         </span>
       </div>
+      {run.steps.length > 0 && <StepList steps={run.steps} />}
       {run.notes.length > 0 && (
-        <div className="faint" style={{ fontSize: 12 }}>
-          {run.notes.map((n, i) => (
+        <div className="faint" style={{ fontSize: 12, maxHeight: 120, overflow: "auto" }}>
+          {run.notes.slice(-12).map((n, i) => (
             <div key={i}>• {n}</div>
           ))}
         </div>
       )}
-      {run.reasoning && (
-        <details>
-          <summary className="faint">Reasoning ({run.reasoning.length} chars, stripped from the result)</summary>
-          <pre className="stream" style={{ maxHeight: 160, minHeight: 0 }}>
-            {run.reasoning}
+      {verifying ? (
+        <pre className="stream mono" aria-live="polite">
+          {run.cmdStream || "…"}
+        </pre>
+      ) : reviewing ? (
+        <>
+          {run.reviewThinking && (
+            <details>
+              <summary className="faint">Planner thinking ({run.reviewThinking.length} chars shown)</summary>
+              <pre className="stream" style={{ maxHeight: 160, minHeight: 0 }}>
+                {run.reviewThinking}
+              </pre>
+            </details>
+          )}
+          <pre className="stream" aria-live="polite">
+            {run.reviewStream || (run.reviewThinking ? `(thinking) ${run.reviewThinking.slice(-500)}` : "…")}
           </pre>
-        </details>
+        </>
+      ) : (
+        <>
+          {run.reasoning && (
+            <details>
+              <summary className="faint">Reasoning ({run.reasoning.length} chars, stripped from the result)</summary>
+              <pre className="stream" style={{ maxHeight: 160, minHeight: 0 }}>
+                {run.reasoning}
+              </pre>
+            </details>
+          )}
+          <pre className="stream" aria-live="polite">
+            {run.stream || "…"}
+          </pre>
+        </>
       )}
-      <pre className="stream" aria-live="polite">
-        {run.stream || "…"}
-      </pre>
       <div>
         <button className="danger" onClick={() => cancelRun(run.runId)}>
           Cancel
@@ -109,7 +215,10 @@ function CallsDetails({ calls }: { calls: CallReport[] }) {
       {calls.map((c) => (
         <div key={c.index} style={{ marginTop: 6 }}>
           <div className="row" style={{ fontSize: 12 }}>
-            <b>Call {c.index + 1}</b>
+            <b>
+              Call {c.index + 1}
+              {c.label ? ` · ${c.label}` : ""}
+            </b>
             <span className="mono">{c.target ?? "all files"}</span>
             <StatusDot status={c.ok ? "done" : "error"} label={c.ok ? "ok" : "failed"} />
           </div>
@@ -124,13 +233,14 @@ function CallsDetails({ calls }: { calls: CallReport[] }) {
 
 function ReviewSection({ run }: { run: RunView }) {
   const anyAccepted = Object.values(run.decisions).some((d) => d === "accepted");
-  const backend = useStore((s) => s.settings?.claudeBackend ?? "cli");
+  useStore((s) => s.settings?.plannerBackend);
+  const who = plannerName();
   if (run.reviewStatus === "idle" && !run.review) {
     return anyAccepted ? (
       <div className="row">
-        <button onClick={() => review(run.runId)}>Review applied diff with Claude</button>
+        <button onClick={() => review(run.runId)}>Review applied diff with {who}</button>
         <span className="faint" style={{ fontSize: 12 }}>
-          checks the accepted changes against the spec ({backend.toUpperCase()})
+          checks the accepted changes against the spec
         </span>
       </div>
     ) : null;
@@ -138,7 +248,7 @@ function ReviewSection({ run }: { run: RunView }) {
   if (run.reviewStatus === "running") {
     return (
       <div className="col">
-        <StatusDot status="running" label="Claude is reviewing the applied diff…" />
+        <StatusDot status="running" label={`${who} is reviewing the applied diff…`} />
         {run.reviewStream && (
           <pre className="stream" style={{ minHeight: 0, maxHeight: 200 }}>
             {run.reviewStream}
@@ -213,8 +323,11 @@ function Finished({ run }: { run: RunView }) {
         <span>
           time <b>{fmtSecs(result.durationMs)}</b>
         </span>
-        <span style={{ color: result.validationOk ? "var(--ok)" : "var(--err)" }}>{result.validationOk ? "✓ all edits valid" : result.cancelled ? "cancelled" : "✗ validation failed"}</span>
+        {!result.workflow && (
+          <span style={{ color: result.validationOk ? "var(--ok)" : "var(--err)" }}>{result.validationOk ? "✓ all edits valid" : result.cancelled ? "cancelled" : "✗ validation failed"}</span>
+        )}
       </div>
+      {result.workflow && <WorkflowPanel w={result.workflow} />}
       {run.error && !result.cancelled && <div className="note err">{run.error}</div>}
       {failedCalls.length > 0 && !result.cancelled && (
         <div className="note err">

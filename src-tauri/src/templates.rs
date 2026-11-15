@@ -11,16 +11,19 @@ pub enum Template {
     Expand,
     ImplementSystem,
     Review,
+    /// The coder's fix round after a failed build / test / run.
+    Fix,
 }
 
 impl Template {
-    pub const ALL: [Template; 3] = [Template::Expand, Template::ImplementSystem, Template::Review];
+    pub const ALL: [Template; 4] = [Template::Expand, Template::ImplementSystem, Template::Review, Template::Fix];
 
     pub fn file_name(self) -> &'static str {
         match self {
             Template::Expand => "expand.md",
             Template::ImplementSystem => "implement-system.md",
             Template::Review => "review.md",
+            Template::Fix => "fix.md",
         }
     }
 
@@ -29,6 +32,7 @@ impl Template {
             Template::Expand => include_str!("../templates/expand.md"),
             Template::ImplementSystem => include_str!("../templates/implement-system.md"),
             Template::Review => include_str!("../templates/review.md"),
+            Template::Fix => include_str!("../templates/fix.md"),
         }
     }
 

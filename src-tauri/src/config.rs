@@ -27,6 +27,17 @@ pub enum ClaudeBackend {
     Api,
 }
 
+/// Who writes the spec and reviews the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum PlannerBackend {
+    /// A local model with thinking on (`Settings::planner_profile`).
+    #[default]
+    Local,
+    /// Claude, through `Settings::claude_backend`.
+    Claude,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -35,6 +46,30 @@ pub struct Settings {
     pub llama_server_path: String,
     pub server_port: u16,
     pub active_profile: String,
+    /// Planner role: writes the spec and reviews the verified result.
+    pub planner_backend: PlannerBackend,
+    /// Local planner: the profile it runs on (thinking on).
+    pub planner_profile: String,
+    /// Local planner: reasoning effort for effort-controlled models (gpt-oss).
+    pub planner_effort: String,
+    /// Local planner: let it read the project with read-only tools (read/list/search).
+    pub planner_tools: bool,
+    /// Coder role: the default profile that writes the code (thinking off).
+    pub coder_profile: String,
+    /// Build/test/run the change in a staging copy and send failures back to the coder.
+    pub verify_enabled: bool,
+    /// Coder attempts to fix failing verification before giving up.
+    pub max_fix_rounds: u32,
+    /// The planner reviews the verified change before it is shown.
+    pub loop_review: bool,
+    /// Follow-up passes a failed review may start (coder implements the review's follow-up
+    /// spec, then verification and review run again).
+    pub follow_up_rounds: u32,
+    pub build_timeout_secs: u64,
+    /// Default timeout for `run` commands (a program still running then counts as started fine).
+    pub run_timeout_secs: u64,
+    /// Start implementing as soon as the spec is written, without the spec review.
+    pub autopilot: bool,
     pub claude_backend: ClaudeBackend,
     pub claude_model: String,
     /// Effort for Claude (`--effort` on the CLI, `output_config.effort` on the API).
@@ -61,7 +96,20 @@ impl Default for Settings {
             models_dir: default_models_dir().to_string_lossy().into_owned(),
             llama_server_path: String::new(),
             server_port: DEFAULT_PORT,
-            active_profile: "qwen3.8-27b".into(),
+            active_profile: "qwen3.6-35b-a3b".into(),
+            planner_backend: PlannerBackend::Local,
+            // One model for both roles: no model swaps, and 64k context for the fix loop.
+            planner_profile: "qwen3.6-35b-a3b".into(),
+            planner_effort: "high".into(),
+            planner_tools: true,
+            coder_profile: "qwen3.6-35b-a3b".into(),
+            verify_enabled: true,
+            max_fix_rounds: 3,
+            loop_review: true,
+            follow_up_rounds: 1,
+            build_timeout_secs: 900,
+            run_timeout_secs: 10,
+            autopilot: false,
             claude_backend: ClaudeBackend::Cli,
             claude_model: "claude-opus-5-5".into(),
             claude_effort: "high".into(),
@@ -139,7 +187,10 @@ pub struct Profile {
     pub launch_args: String,
     pub context_limit: u32,
     pub max_output_tokens: u32,
+    /// Sampling for the coder role (thinking off).
     pub sampling: Sampling,
+    /// Sampling for the planner role (thinking on); `None` → `sampling`.
+    pub thinking_sampling: Option<Sampling>,
     pub reasoning: ReasoningControl,
     pub external: ExternalEndpoint,
 }
@@ -161,13 +212,32 @@ impl Default for Profile {
             context_limit: 32768,
             max_output_tokens: 8192,
             sampling: Sampling::default(),
+            thinking_sampling: None,
             reasoning: ReasoningControl::qwen(),
             external: ExternalEndpoint::default(),
         }
     }
 }
 
+/// Qwen3.6 model card, thinking mode for precise coding tasks: temperature 0.6, top_p 0.95,
+/// top_k 20, min_p 0, presence_penalty 0 (the general-task 1.5 would push exact names around).
+pub fn qwen_thinking_sampling() -> Sampling {
+    Sampling {
+        temperature: 0.6,
+        top_p: 0.95,
+        top_k: 20,
+        min_p: 0.0,
+        presence_penalty: 0.0,
+        repeat_penalty: 1.0,
+    }
+}
+
 impl Profile {
+    /// Sampling for the planner role.
+    pub fn planner_sampling(&self) -> &Sampling {
+        self.thinking_sampling.as_ref().unwrap_or(&self.sampling)
+    }
+
     pub fn resolved_gguf(&self, models_dir: &Path) -> PathBuf {
         if !self.gguf_path.trim().is_empty() {
             PathBuf::from(self.gguf_path.trim())
@@ -204,6 +274,7 @@ pub fn builtin_profiles() -> Vec<Profile> {
                 presence_penalty: 0.0,
                 repeat_penalty: 1.0,
             },
+            thinking_sampling: Some(qwen_thinking_sampling()),
             reasoning: ReasoningControl::qwen(),
             ..Default::default()
         },
@@ -229,6 +300,7 @@ pub fn builtin_profiles() -> Vec<Profile> {
                 presence_penalty: 0.0,
                 repeat_penalty: 1.0,
             },
+            thinking_sampling: Some(qwen_thinking_sampling()),
             reasoning: ReasoningControl::qwen(),
             ..Default::default()
         },
@@ -316,6 +388,10 @@ pub fn upgrade_untouched_builtins(list: &mut [Profile]) {
     for b in builtin_profiles() {
         let (args, ctx) = previous_defaults(&b.id);
         for p in list.iter_mut().filter(|p| p.id == b.id && p.builtin) {
+            // Saved before the planner role existed.
+            if p.thinking_sampling.is_none() {
+                p.thinking_sampling = b.thinking_sampling.clone();
+            }
             if args.contains(&p.launch_args.trim()) {
                 p.launch_args = b.launch_args.clone();
             }
@@ -406,7 +482,12 @@ mod tests {
         list.push(custom.clone());
         upgrade_untouched_builtins(&mut list);
         for (got, want) in list.iter().zip(&b) {
-            assert_eq!((&got.launch_args, got.context_limit), (&want.launch_args, want.context_limit), "{}", got.id);
+            assert_eq!(
+                (&got.launch_args, got.context_limit),
+                (&want.launch_args, want.context_limit),
+                "{}",
+                got.id
+            );
         }
         assert_eq!(list[3].launch_args, custom.launch_args, "custom profiles are not touched");
         let mut list = vec![edited.clone()];

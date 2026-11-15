@@ -33,7 +33,7 @@ try {
 
   // Prewarm is off by default; turn it on (same as the Settings checkbox).
   check((await c.state("s.settings.prewarmPrompt")) === false, "prewarm is off by default");
-  await c.ev("window.__relay.actions.saveSettings({ prewarmPrompt: true })");
+  await c.ev("window.__relay.actions.saveSettings({ prewarmPrompt: true, verifyEnabled: false, loopReview: false, plannerBackend: 'claude' })");
 
   // The spec before any model is loaded: estimated counts, no prewarm (it never loads a model).
   await c.ev(`window.__relay.actions.setSpec(${JSON.stringify(SPEC)})`);

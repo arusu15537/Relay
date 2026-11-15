@@ -22,6 +22,7 @@ try {
   await c.wait(`${S}.checked.includes('src/http_client.py')`, 3000, "file ticked");
   check(true, "instruction typed and src/http_client.py ticked as context");
   const t0 = Date.now();
+  await c.ev("window.__relay.actions.saveSettings({ plannerBackend: 'claude', verifyEnabled: false, loopReview: false })");
   await c.click("Expand with Claude");
   await c.wait(`${S}.expandStatus === 'running'`, 5000);
   await c.wait(`${S}.claudeStream.length > 200`, 240000, "Claude streaming");

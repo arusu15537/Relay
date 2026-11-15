@@ -13,9 +13,11 @@
 //! ...
 //! ## Edge cases
 //! ## Acceptance criteria
+//! ## Verification      (optional: `- build: `cargo build``, `- test: …`, `- run: … (timeout 10s)`)
 //! ```
 
 use crate::pathsafe::normalize_rel;
+use crate::verify::{VerifyCommand, parse_verification_item};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -50,6 +52,13 @@ pub struct ParsedSpec {
     pub acceptance: String,
     /// Other backticked paths mentioned anywhere in the spec (deduplicated, excluding `files`).
     pub mentioned_paths: Vec<String>,
+    /// Commands from `## Verification`, in order.
+    #[serde(default)]
+    pub verification: Vec<VerifyCommand>,
+    /// The spec has a `## Verification` section (possibly saying there is nothing to run). Without
+    /// one, the commands detected from the project are used.
+    #[serde(default)]
+    pub verification_declared: bool,
     pub warnings: Vec<String>,
 }
 
@@ -86,6 +95,7 @@ enum Section {
     Changes,
     EdgeCases,
     Acceptance,
+    Verification,
     Other,
 }
 
@@ -103,6 +113,8 @@ fn classify(title: &str) -> Section {
         Section::EdgeCases
     } else if t.starts_with("acceptance") {
         Section::Acceptance
+    } else if t.starts_with("verification") || t.starts_with("verify") || t == "commands" {
+        Section::Verification
     } else {
         Section::Other
     }
@@ -200,7 +212,7 @@ pub fn parse_spec(md: &str) -> ParsedSpec {
             fence_lines = 0;
         } else if in_fence && !line.trim().is_empty() {
             fence_lines += 1;
-        } else if !in_fence {
+        } else if !in_fence && section != Section::Verification {
             for cap in BACKTICK.captures_iter(line) {
                 if is_code_expression(&cap[1]) && !expressions.iter().any(|e| e == &cap[1]) {
                     expressions.push(cap[1].to_string());
@@ -221,6 +233,9 @@ pub fn parse_spec(md: &str) -> ParsedSpec {
                 }
                 flush_change(&mut spec, &mut current_change);
                 section = class;
+                if class == Section::Verification {
+                    spec.verification_declared = true;
+                }
                 continue;
             }
             if section == Section::Changes
@@ -272,6 +287,25 @@ pub fn parse_spec(md: &str) -> ParsedSpec {
             }
             Section::EdgeCases => edge.push(line),
             Section::Acceptance => acc.push(line),
+            Section::Verification => {
+                spec.verification_declared = true;
+                let t = line.trim_start();
+                if t.starts_with("- ")
+                    || t.starts_with("* ")
+                    || t.split_once(". ")
+                        .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                {
+                    match parse_verification_item(line) {
+                        Ok(Some(cmd)) => {
+                            if !spec.verification.contains(&cmd) {
+                                spec.verification.push(cmd);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(w) => spec.warnings.push(w),
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -281,9 +315,17 @@ pub fn parse_spec(md: &str) -> ParsedSpec {
     spec.edge_cases = edge.join("\n").trim().to_string();
     spec.acceptance = acc.join("\n").trim().to_string();
 
-    // Paths mentioned elsewhere (e.g. "see `src/types.ts`").
+    // Paths mentioned elsewhere (e.g. "see `src/types.ts`"), outside the Verification commands.
     let mut mentioned = Vec::new();
-    for cap in BACKTICK.captures_iter(&text) {
+    let commands: String = spec.verification.iter().map(|v| format!("`{}`", v.command)).collect();
+    let prose = BACKTICK.replace_all(&text, |c: &regex::Captures| {
+        if commands.contains(&format!("`{}`", &c[1])) {
+            String::new()
+        } else {
+            c[0].to_string()
+        }
+    });
+    for cap in BACKTICK.captures_iter(&prose) {
         let c = cap[1].trim();
         if looks_like_path(c)
             && let Ok(p) = normalize_rel(c)
@@ -514,7 +556,11 @@ Export it.
         assert!(s.warnings.is_empty(), "a Mermaid class diagram is not code: {:?}", s.warnings);
         for f in ["client.py", "retry.py"] {
             let p = per_file_spec(&s, f);
-            let (summary, design, changes) = (p.find("## Summary").unwrap(), p.find("## Design").unwrap(), p.find("## Changes for").unwrap());
+            let (summary, design, changes) = (
+                p.find("## Summary").unwrap(),
+                p.find("## Design").unwrap(),
+                p.find("## Changes for").unwrap(),
+            );
             assert!(summary < design && design < changes, "{p}");
             assert!(p.contains("`delay(attempt: int) -> float`"), "{f} must see the shared signatures");
         }
@@ -551,12 +597,73 @@ Export it.
         ] {
             assert!(!is_code_expression(ok), "{ok}");
         }
-        let s = parse_spec("## Files\n- `a.py` (modify)\n## Changes\n### `a.py`\nWait `self._sleep(self._backoff_delay(n))` between at most `max_retries + 1` attempts.\n");
+        let s = parse_spec(
+            "## Files\n- `a.py` (modify)\n## Changes\n### `a.py`\nWait `self._sleep(self._backoff_delay(n))` between at most `max_retries + 1` attempts.\n",
+        );
         assert!(
-            s.warnings.iter().any(|w| w.contains("1 expression(s) in code syntax (`self._sleep(self._backoff_delay(n))`)")),
+            s.warnings
+                .iter()
+                .any(|w| w.contains("1 expression(s) in code syntax (`self._sleep(self._backoff_delay(n))`)")),
             "{:?}",
             s.warnings
         );
+    }
+
+    #[test]
+    fn verification_section_lists_commands() {
+        let s = parse_spec(&format!(
+            "{SPEC}\n## Verification\n- build: `cargo build`\n- **test**: `cargo test -- --nocapture`\n- run: `cargo run -- --help` (timeout 20s, expect \"Usage\")\n- lint — `cargo clippy`\n- deploy: `rm -rf /`\n- run the game and look at it\n"
+        ));
+        assert!(s.verification_declared);
+        let got: Vec<(&str, &str, Option<u64>, Option<&str>)> = s
+            .verification
+            .iter()
+            .map(|v| (v.kind.word(), v.command.as_str(), v.timeout_secs, v.expect.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("build", "cargo build", None, None),
+                ("test", "cargo test -- --nocapture", None, None),
+                ("run", "cargo run -- --help", Some(20), Some("Usage")),
+                ("build", "cargo clippy", None, None),
+            ]
+        );
+        assert!(
+            s.warnings.iter().any(|w| w.contains("Unknown verification step `deploy`")),
+            "{:?}",
+            s.warnings
+        );
+        assert!(
+            s.warnings
+                .iter()
+                .any(|w| w.contains("Could not read a command") && w.contains("look at it"))
+        );
+        assert!(
+            !s.warnings.iter().any(|w| w.contains("expression")),
+            "commands are not code expressions: {:?}",
+            s.warnings
+        );
+        assert!(!s.mentioned_paths.iter().any(|p| p.contains("cargo")), "{:?}", s.mentioned_paths);
+        // The other sections are unaffected.
+        assert_eq!(s.acceptance, "- 3 attempts max.");
+        assert_eq!(s.files.len(), 3);
+    }
+
+    #[test]
+    fn verification_can_be_declared_empty_or_left_out() {
+        let none = parse_spec(&format!("{SPEC}\n## Verification\n- None (static page).\n"));
+        assert!(none.verification_declared && none.verification.is_empty());
+        assert!(none.warnings.is_empty(), "{:?}", none.warnings);
+        let empty = parse_spec(&format!("{SPEC}\n## Verification\n"));
+        assert!(empty.verification_declared && empty.verification.is_empty());
+        let absent = parse_spec(SPEC);
+        assert!(!absent.verification_declared && absent.verification.is_empty());
+        // A command that runs a project file still mentions nothing as a path.
+        let py = parse_spec(&format!(
+            "{SPEC}\n## Verification\n- test: `python -m pytest tests/test_retry.py`\n"
+        ));
+        assert_eq!(py.verification[0].command, "python -m pytest tests/test_retry.py");
     }
 
     #[test]

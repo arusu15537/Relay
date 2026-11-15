@@ -29,7 +29,8 @@ try {
   execFileSync("git", ["-C", root, "clean", "-fdq"]);
   await c.ev("window.__relay.actions.stopServer()");
   await c.wait("window.__relay.useStore.getState().server?.state !== 'ready'", 15000, "no model loaded");
-  await c.ev("window.__relay.actions.saveSettings({ activeProfile: 'qwen3.8-27b' })");
+  // The plain implement path (uitest-loop.mjs covers verification and review).
+  await c.ev("window.__relay.actions.saveSettings({ activeProfile: 'qwen3.8-27b', verifyEnabled: false, loopReview: false, plannerBackend: 'claude' })");
   await c.ev("window.__relay.useStore.setState({ implementProfile: 'qwen3.8-27b' })"); // = the Spec pane's model select
   await c.ev("window.__relay.actions.refreshFiles()");
 

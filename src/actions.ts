@@ -15,7 +15,7 @@ export async function boot() {
     settings: st.settings,
     profiles: st.profiles,
     server: st.server,
-    implementProfile: st.settings.activeProfile,
+    implementProfile: st.settings.coderProfile || st.settings.activeProfile,
     ready: true,
   });
   for (const n of st.startupNotes) toast(n);
@@ -59,15 +59,57 @@ function onRunEvent(ev: T.RunEvent) {
   if (!run) return;
   switch (ev.kind) {
     case "start":
-      updateRun(ev.runId, () => ({ notes: [`Mode: ${ev.mode === "perFile" ? "one call per file" : "single call"}, ${ev.calls} call(s)`] }));
+      updateRun(ev.runId, (r) => ({ notes: [...r.notes, `Mode: ${ev.mode === "perFile" ? "one call per file" : "single call"}, ${ev.calls} call(s)`] }));
       break;
     case "callStart":
       updateRun(ev.runId, (r) => ({
         stream: "",
         reasoning: "",
-        callLabel: `${ev.target ?? "All files"} — call ${(ev.call ?? 0) + 1}, attempt ${ev.attempt}`,
+        callLabel: `${ev.label ? `${ev.label} · ` : ""}${ev.target ?? "All files"} — attempt ${ev.attempt}`,
         notes: r.notes,
       }));
+      break;
+    case "phase":
+      updateRun(ev.runId, () => ({ phase: (ev.step as T.StepKind) ?? null, callLabel: ev.label ?? "" }));
+      break;
+    case "stepEnd":
+      updateRun(ev.runId, (r) => ({
+        steps: [...r.steps, { kind: ev.step as T.StepKind, label: ev.label ?? "", ok: !!ev.ok, detail: ev.detail ?? "" }],
+      }));
+      break;
+    case "cmdStart":
+      updateRun(ev.runId, () => ({
+        phase: "verify",
+        cmdStream: `> ${ev.command}\n`,
+        callLabel: `Running ${ev.step}: ${ev.command} (timeout ${ev.timeoutSecs ?? "?"}s)`,
+      }));
+      break;
+    case "cmdOutput":
+      updateRun(ev.runId, (r) => {
+        const next = r.cmdStream + (ev.text ?? "");
+        return { cmdStream: next.length > 40000 ? next.slice(-30000) : next };
+      });
+      break;
+    case "cmdEnd":
+      updateRun(ev.runId, (r) => ({ notes: [...r.notes, `${ev.passed ? "✓" : "✗"} ${ev.summary ?? ev.command}`] }));
+      break;
+    case "reviewDelta":
+      updateRun(ev.runId, (r) => ({ phase: "review", reviewStatus: "running", reviewStream: r.reviewStream + (ev.text ?? "") }));
+      break;
+    case "reviewSegment":
+      updateRun(ev.runId, () => ({ reviewStream: "" }));
+      break;
+    case "reviewReasoning":
+      updateRun(ev.runId, (r) => ({ phase: "review", reviewStatus: "running", reviewThinking: (r.reviewThinking + (ev.text ?? "")).slice(-6000) }));
+      break;
+    case "reviewTool":
+      updateRun(ev.runId, (r) => ({ notes: [...r.notes, `🔍 planner: ${ev.text}`] }));
+      break;
+    case "reviewStatus":
+      if (ev.text) updateRun(ev.runId, (r) => ({ notes: [...r.notes, ev.text ?? ""] }));
+      break;
+    case "reviewStats":
+      updateRun(ev.runId, () => ({ liveTps: ev.tokPerSec ?? null, tokens: ev.tokens ?? 0 }));
       break;
     case "delta":
       updateRun(ev.runId, (r) => ({ stream: r.stream + (ev.text ?? "") }));
@@ -120,8 +162,12 @@ function onClaudeEvent(ev: T.ClaudeEvent) {
     }
     return;
   }
-  const run = s.runs.find((r) => r.reviewJobId === ev.jobId);
-  if (run && ev.kind === "delta") updateRun(run.runId, (r) => ({ reviewStream: r.reviewStream + ev.text }));
+  const run = s.runs.find((r) => r.reviewJobId === ev.jobId || `${r.runId}:review` === ev.jobId);
+  if (!run) return;
+  if (ev.kind === "delta") updateRun(run.runId, (r) => ({ reviewStream: r.reviewStream + ev.text }));
+  else if (ev.kind === "thinking") updateRun(run.runId, (r) => ({ reviewThinking: (r.reviewThinking + ev.text).slice(-6000) }));
+  else if (ev.kind === "segment") updateRun(run.runId, () => ({ reviewStream: "" }));
+  else if (ev.kind === "tool") updateRun(run.runId, (r) => ({ notes: [...r.notes, `🔍 planner: ${ev.text}`] }));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -231,8 +277,14 @@ export function toggleFullContext(path: string) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Expand (Claude)
+// Expand (the planner: a local model with thinking on, or Claude)
 // ---------------------------------------------------------------------------------------------
+
+export function plannerName(): string {
+  const st = get().settings;
+  if (!st || st.plannerBackend === "claude") return "Claude";
+  return profileName(st.plannerProfile);
+}
 
 export async function expand() {
   const s = get();
@@ -246,7 +298,7 @@ export async function expand() {
     claudeStream: "",
     claudeThinking: "",
     claudeActivity: [],
-    expandInfo: "Starting Claude…",
+    expandInfo: `Starting ${plannerName()}…`,
     expandError: null,
     spec: "",
     prepared: null,
@@ -262,14 +314,25 @@ export async function expand() {
     }
     const cost = res.claude.costUsd != null ? ` · $${res.claude.costUsd.toFixed(3)}` : "";
     const cached = res.claude.cacheReadTokens ? ` · ${(res.claude.cacheReadTokens / 1000).toFixed(1)}k tokens from cache` : "";
+    const secs = `${(res.claude.durationMs / 1000).toFixed(0)}s`;
+    const local = res.claude.backend === "local";
+    const tools = res.claude.toolCalls?.length ? ` · ${res.claude.toolCalls.length} file look-up(s)` : "";
+    const speed = res.claude.tokPerSec ? ` · ${res.claude.tokPerSec.toFixed(0)} tok/s` : "";
     set({
       spec: res.spec,
       expandStatus: "done",
       specStatus: res.parsed.files.length ? "done" : "error",
-      expandInfo: `Spec written by Claude (${res.claude.backend.toUpperCase()}) in ${(res.claude.durationMs / 1000).toFixed(0)}s${cost}${cached}`,
+      expandInfo: local
+        ? `Spec written by ${res.claude.model} (local planner) in ${secs}${speed}${tools}`
+        : `Spec written by Claude (${res.claude.backend.toUpperCase()}) in ${secs}${cost}${cached}`,
     });
     for (const w of res.warnings) toast(w);
     schedulePrepare(0);
+    // Autopilot: no spec review — implement right away if the spec names files.
+    if (get().settings?.autopilot && res.parsed.files.length > 0 && !res.parsed.warnings.some((w) => w.includes("no `## Files`"))) {
+      toast("Autopilot: implementing the spec without review", "info");
+      await implement();
+    }
   } catch (e) {
     set({ expandStatus: "error", specStatus: "idle", expandError: errText(e), expandInfo: "" });
   }
@@ -359,7 +422,11 @@ function newRun(runId: string, profileId: string, spec: string): RunView {
     review: null,
     reviewStatus: "idle",
     reviewStream: "",
+    reviewThinking: "",
     reviewJobId: uid(),
+    phase: null,
+    steps: [],
+    cmdStream: "",
     startedAt: Date.now(),
     spec,
     fromHistory: false,
@@ -395,12 +462,17 @@ export async function implement(profileId?: string, specOverride?: string) {
     const r = resp.result;
     const decisions: Record<string, "pending"> = {};
     for (const f of r.files) decisions[f.path] = "pending";
+    const wf = r.workflow;
+    const failedLoop = wf && (wf.verified === false || (wf.review && !wf.review.passed));
     updateRun(runId, () => ({
-      status: r.cancelled ? "idle" : r.validationOk ? "done" : "error",
+      status: r.cancelled ? "idle" : !r.validationOk || failedLoop ? "error" : "done",
       response: resp,
       decisions,
       error: r.cancelled ? "Cancelled" : r.error,
-      callLabel: r.cancelled ? "Cancelled" : r.validationOk ? "Done" : "Validation failed",
+      callLabel: r.cancelled ? "Cancelled" : wf ? wf.outcome : r.validationOk ? "Done" : "Validation failed",
+      review: wf?.review ?? null,
+      reviewStatus: wf?.review ? (wf.review.passed ? "done" : "error") : "idle",
+      phase: null,
     }));
     if (resp.fallbackSuggested && resp.fallbackProfile) {
       const fb = resp.fallbackProfile;
@@ -513,7 +585,8 @@ function afterDecision(runId: string) {
   const values = Object.values(run.decisions);
   const allDecided = values.length > 0 && values.every((d) => d !== "pending");
   const anyAccepted = values.some((d) => d === "accepted");
-  if (allDecided && anyAccepted && get().settings?.reviewEnabled && run.reviewStatus === "idle") {
+  // The loop reviews before the diff is shown; the old post-accept review only for plain runs.
+  if (allDecided && anyAccepted && get().settings?.reviewEnabled && run.reviewStatus === "idle" && !run.response?.result.workflow) {
     review(runId);
   }
 }
@@ -553,7 +626,7 @@ export function applyFollowUp(runId: string) {
     activeRun: null,
     compareWith: null,
     expandStatus: "done",
-    expandInfo: "Follow-up spec from Claude's review",
+    expandInfo: `Follow-up spec from ${plannerName()}'s review`,
   }));
   schedulePrepare(0);
 }
@@ -578,8 +651,9 @@ export async function loadJob(jobId: string) {
       response,
       decisions,
       error: r.error,
-      review: r.review,
+      review: r.review ?? r.result?.workflow?.review ?? null,
       reviewStatus: r.review ? (r.review.passed ? "done" : "error") : "idle",
+      steps: (r.result?.workflow?.steps ?? []).map((s) => ({ kind: s.kind, label: s.label, ok: s.ok, detail: s.detail })),
       fromHistory: true,
     };
   });
@@ -591,7 +665,9 @@ export async function loadJob(jobId: string) {
     checked: d.job.contextFiles,
     fullContext: [],
     expandStatus: d.job.spec ? "done" : "idle",
-    expandInfo: d.job.claudeBackend ? `Spec by Claude (${d.job.claudeBackend})${d.job.specEdited ? ", edited" : ""}` : "",
+    expandInfo: d.job.claudeBackend
+      ? `Spec by ${d.job.claudeBackend === "local" ? `${d.job.claudeModel} (local planner)` : `Claude (${d.job.claudeBackend})`}${d.job.specEdited ? ", edited" : ""}`
+      : "",
     runs,
     activeRun: runs.length ? runs[runs.length - 1].runId : null,
     compareWith: null,

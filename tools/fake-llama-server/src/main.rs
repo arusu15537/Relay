@@ -12,8 +12,11 @@
 //! first, like gpt-oss).
 //!
 //! Answers: if env `FAKE_LLM_SCRIPT` points at a JSON array of
-//! `{"contains": "...", "response": "...", "reasoning": "..."}`, the first rule whose `contains`
-//! occurs in the last user message wins. Otherwise a synthetic answer is produced: for every
+//! `{"contains": "...", "response": "...", "reasoning": "...", "after_tool": bool,
+//! "tool_calls": [{"name": "...", "arguments": {...}}]}`, the first rule whose `contains` occurs
+//! in the last user message wins. `after_tool` (optional) limits a rule to requests whose last
+//! message is (true) or is not (false) a tool result; `tool_calls` are streamed as OpenAI tool
+//! calls (finish_reason `tool_calls`) when the request offers tools. Otherwise a synthetic answer is produced: for every
 //! file under "# Files to edit" it emits a valid SEARCH/REPLACE block appending a marker comment
 //! (or creates new files), so any spec flows through Relay's pipeline.
 //!
@@ -437,17 +440,26 @@ fn chat(stream: TcpStream, body: &Value, o: &Opts, start: Instant) -> std::io::R
     let prompt = render_prompt(body);
     let cached_bytes = reuse(&prompt, o.recurrent);
     let user = last_user(body);
+    let after_tool = body["messages"]
+        .as_array()
+        .and_then(|m| m.last())
+        .is_some_and(|m| m["role"] == "tool");
+    let offers_tools = body["tools"].as_array().is_some_and(|t| !t.is_empty());
     let mut response = String::new();
     let mut reasoning = String::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
     if let Ok(path) = std::env::var("FAKE_LLM_SCRIPT") {
         if let Ok(text) = std::fs::read_to_string(&path) {
             if let Ok(Value::Array(rules)) = serde_json::from_str::<Value>(&text) {
-                if let Some(r) = rules
-                    .iter()
-                    .find(|r| user.contains(r["contains"].as_str().unwrap_or("\u{0}")))
-                {
+                if let Some(r) = rules.iter().find(|r| {
+                    user.contains(r["contains"].as_str().unwrap_or("\u{0}"))
+                        && r["after_tool"].as_bool().is_none_or(|a| a == after_tool)
+                }) {
                     response = r["response"].as_str().unwrap_or("").to_string();
                     reasoning = r["reasoning"].as_str().unwrap_or("").to_string();
+                    if offers_tools {
+                        tool_calls = r["tool_calls"].as_array().cloned().unwrap_or_default();
+                    }
                 }
             }
         }
@@ -463,8 +475,11 @@ fn chat(stream: TcpStream, body: &Value, o: &Opts, start: Instant) -> std::io::R
         start,
         "I",
         &format!(
-            "slot launch_slot_: processing task (enable_thinking={}, reasoning_effort={})",
-            !thinking_disabled, body["reasoning_effort"]
+            "slot launch_slot_: processing task (enable_thinking={}, reasoning_effort={}, tools={}, after_tool={after_tool}, temperature={})",
+            !thinking_disabled,
+            body["reasoning_effort"],
+            body["tools"].as_array().map(|t| t.len()).unwrap_or(0),
+            body["temperature"]
         ),
     );
     let mut s = &stream;
@@ -484,6 +499,27 @@ fn chat(stream: TcpStream, body: &Value, o: &Opts, start: Instant) -> std::io::R
     }
     let max = body["max_tokens"].as_u64().unwrap_or(u64::MAX);
     let mut finish = "stop";
+    if !tool_calls.is_empty() {
+        // Streamed like llama-server: id and name first, the arguments in pieces.
+        for (i, tc) in tool_calls.iter().enumerate() {
+            let name = tc["name"].as_str().unwrap_or("");
+            let args = tc["arguments"].to_string();
+            sse(
+                s,
+                &json!({"choices":[{"index":0,"finish_reason":null,"delta":{"tool_calls":[{"index": i, "id": format!("call_{i}_{}", n), "type": "function", "function": {"name": name, "arguments": ""}}]}}]}),
+            )?;
+            for piece in split_tokens(&args) {
+                sse(
+                    s,
+                    &json!({"choices":[{"index":0,"finish_reason":null,"delta":{"tool_calls":[{"index": i, "function": {"arguments": piece}}]}}]}),
+                )?;
+                n += 1;
+                std::thread::sleep(delay);
+            }
+        }
+        finish = "tool_calls";
+        response.clear();
+    }
     for piece in split_tokens(&response) {
         if n >= max {
             finish = "length";

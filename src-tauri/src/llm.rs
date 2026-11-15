@@ -1,7 +1,7 @@
 //! Streaming client for OpenAI-compatible chat completions (llama-server, LM Studio, Ollama).
 
-use crate::config::Profile;
-use crate::reasoning::apply_request_params;
+use crate::config::{Profile, Sampling};
+use crate::reasoning::{apply_request_params, apply_thinking_params};
 use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -9,29 +9,64 @@ use serde_json::{Value, json};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Assistant turn that called tools (OpenAI format).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Tool result: the id of the call it answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// The model's reasoning for an earlier assistant turn of the same request (llama-server
+    /// passes it to the chat template, which keeps it between tool calls).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct FunctionCall {
+    pub name: String,
+    /// JSON text, as the model wrote it.
+    pub arguments: String,
 }
 
 impl ChatMessage {
-    pub fn system(c: impl Into<String>) -> Self {
+    fn new(role: &str, c: impl Into<String>) -> Self {
         Self {
-            role: "system".into(),
+            role: role.into(),
             content: c.into(),
+            ..Default::default()
         }
+    }
+    pub fn system(c: impl Into<String>) -> Self {
+        Self::new("system", c)
     }
     pub fn user(c: impl Into<String>) -> Self {
-        Self {
-            role: "user".into(),
-            content: c.into(),
-        }
+        Self::new("user", c)
     }
     pub fn assistant(c: impl Into<String>) -> Self {
+        Self::new("assistant", c)
+    }
+    pub fn assistant_tool_calls(content: impl Into<String>, calls: Vec<ToolCall>) -> Self {
         Self {
-            role: "assistant".into(),
-            content: c.into(),
+            tool_calls: Some(calls),
+            ..Self::new("assistant", content)
+        }
+    }
+    pub fn tool_result(call_id: &str, content: impl Into<String>) -> Self {
+        Self {
+            tool_call_id: Some(call_id.to_string()),
+            ..Self::new("tool", content)
         }
     }
 }
@@ -66,6 +101,9 @@ pub struct ChatOutcome {
     pub duration_ms: u64,
     pub ttft_ms: Option<u64>,
     pub cancelled: bool,
+    /// Tool calls the model made (streamed in pieces, assembled by index).
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -81,9 +119,34 @@ pub enum Delta<'a> {
     Reasoning(&'a str),
 }
 
-/// Build the request body for a profile: sampling defaults + reasoning control.
+/// Build the request body for a profile in the coder role: sampling defaults + reasoning
+/// suppressed.
 pub fn build_body(profile: &Profile, model: &str, messages: &[ChatMessage], max_tokens: u32) -> Value {
-    let s = &profile.sampling;
+    let mut body = base_body(&profile.sampling, model, messages, max_tokens);
+    apply_request_params(&profile.reasoning, &mut body);
+    body
+}
+
+/// The request body for the planner role: thinking on, the profile's thinking-mode sampling,
+/// and optionally tools (OpenAI function definitions).
+pub fn build_planner_body(
+    profile: &Profile,
+    model: &str,
+    messages: &[ChatMessage],
+    max_tokens: u32,
+    effort: &str,
+    tools: Option<&Value>,
+) -> Value {
+    let mut body = base_body(profile.planner_sampling(), model, messages, max_tokens);
+    apply_thinking_params(&profile.reasoning, &mut body, effort);
+    if let Some(t) = tools.filter(|t| t.as_array().is_some_and(|a| !a.is_empty())) {
+        body["tools"] = t.clone();
+        body["tool_choice"] = json!("auto");
+    }
+    body
+}
+
+fn base_body(s: &Sampling, model: &str, messages: &[ChatMessage], max_tokens: u32) -> Value {
     let mut body = json!({
         "model": if model.is_empty() { "local" } else { model },
         "messages": messages,
@@ -101,8 +164,33 @@ pub fn build_body(profile: &Profile, model: &str, messages: &[ChatMessage], max_
     if (s.repeat_penalty - 1.0).abs() > f32::EPSILON {
         body["repeat_penalty"] = json!(s.repeat_penalty);
     }
-    apply_request_params(&profile.reasoning, &mut body);
     body
+}
+
+/// Merge one streamed `delta.tool_calls` array into the calls assembled so far: pieces with the
+/// same `index` belong to the same call; `id` and `name` arrive once, `arguments` in fragments.
+pub fn merge_tool_call_deltas(calls: &mut Vec<ToolCall>, deltas: &Value) {
+    for (pos, d) in deltas.as_array().into_iter().flatten().enumerate() {
+        let i = d.get("index").and_then(|i| i.as_u64()).map(|i| i as usize).unwrap_or(pos);
+        while calls.len() <= i {
+            calls.push(ToolCall {
+                kind: "function".into(),
+                ..Default::default()
+            });
+        }
+        let c = &mut calls[i];
+        if let Some(id) = d.get("id").and_then(|x| x.as_str()).filter(|x| !x.is_empty()) {
+            c.id = id.to_string();
+        }
+        if let Some(f) = d.get("function") {
+            if let Some(n) = f.get("name").and_then(|x| x.as_str()).filter(|x| !x.is_empty()) {
+                c.function.name.push_str(n);
+            }
+            if let Some(a) = f.get("arguments").and_then(|x| x.as_str()) {
+                c.function.arguments.push_str(a);
+            }
+        }
+    }
 }
 
 /// Incremental Server-Sent-Events parser: feed raw text, get complete `data:` payloads.
@@ -239,6 +327,10 @@ pub async fn stream_chat(
                     .and_then(|r| r.as_str())
                     .unwrap_or("");
                 let content = delta.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                if let Some(tc) = delta.get("tool_calls").filter(|t| t.is_array()) {
+                    merge_tool_call_deltas(&mut out.tool_calls, tc);
+                    *tokens += 1;
+                }
                 for (piece, is_reasoning) in [(reasoning, true), (content, false)] {
                     if piece.is_empty() {
                         continue;
@@ -298,6 +390,12 @@ pub async fn stream_chat(
     }
     out.duration_ms = started.elapsed().as_millis() as u64;
     out.ttft_ms = first_token.map(|t| t.duration_since(started).as_millis() as u64);
+    // Some servers send calls without ids; the follow-up request must still pair results to calls.
+    for (i, c) in out.tool_calls.iter_mut().enumerate() {
+        if c.id.is_empty() {
+            c.id = format!("call_{i}");
+        }
+    }
     if out.tok_per_sec.is_none()
         && let Some(ft) = first_token
     {
@@ -345,6 +443,60 @@ mod tests {
     }
 
     #[test]
+    fn planner_body_thinks_and_offers_tools() {
+        let profiles = builtin_profiles();
+        let msgs = vec![ChatMessage::user("plan")];
+        let tools = json!([{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]);
+        let q = build_planner_body(&profiles[1], "", &msgs, 4000, "high", Some(&tools));
+        assert_eq!(q["chat_template_kwargs"]["enable_thinking"], json!(true));
+        assert_eq!(
+            q["temperature"].as_f64().map(|t| (t * 10.0).round()),
+            Some(6.0),
+            "thinking-mode sampling"
+        );
+        assert_eq!(q["top_p"].as_f64().map(|t| (t * 100.0).round()), Some(95.0));
+        assert_eq!(q["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(q["tool_choice"], "auto");
+        let no_tools = build_planner_body(&profiles[1], "", &msgs, 4000, "high", Some(&json!([])));
+        assert!(no_tools.get("tools").is_none());
+        let g = build_planner_body(&profiles[2], "", &msgs, 4000, "high", None);
+        assert_eq!(g["reasoning_effort"], json!("high"));
+        assert_eq!(g["temperature"], json!(1.0), "gpt-oss keeps its sampling");
+        // The coder role of the same profile still has thinking off.
+        assert_eq!(
+            build_body(&profiles[1], "", &msgs, 10)["chat_template_kwargs"]["enable_thinking"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn tool_call_deltas_are_assembled_by_index() {
+        let mut calls = Vec::new();
+        merge_tool_call_deltas(
+            &mut calls,
+            &json!([{"index": 0, "id": "c1", "type": "function", "function": {"name": "read_file", "arguments": ""}}]),
+        );
+        merge_tool_call_deltas(&mut calls, &json!([{"index": 0, "function": {"arguments": "{\"path\": \"src/"}}]));
+        merge_tool_call_deltas(
+            &mut calls,
+            &json!([{"index": 1, "id": "c2", "function": {"name": "search", "arguments": "{}"}}]),
+        );
+        merge_tool_call_deltas(&mut calls, &json!([{"index": 0, "function": {"arguments": "a.rs\"}"}}]));
+        assert_eq!(calls.len(), 2);
+        assert_eq!((calls[0].id.as_str(), calls[0].function.name.as_str()), ("c1", "read_file"));
+        assert_eq!(calls[0].function.arguments, r#"{"path": "src/a.rs"}"#);
+        assert_eq!(calls[1].function.name, "search");
+        // Messages with tool calls serialize in OpenAI format; plain ones stay plain.
+        let m = serde_json::to_value(ChatMessage::assistant_tool_calls("", calls.clone())).unwrap();
+        assert_eq!(m["tool_calls"][0]["type"], "function");
+        assert_eq!(m["tool_calls"][0]["function"]["name"], "read_file");
+        let r = serde_json::to_value(ChatMessage::tool_result("c1", "text")).unwrap();
+        assert_eq!((r["role"].as_str(), r["tool_call_id"].as_str()), (Some("tool"), Some("c1")));
+        let plain = serde_json::to_value(ChatMessage::user("x")).unwrap();
+        assert!(plain.get("tool_calls").is_none() && plain.get("tool_call_id").is_none());
+    }
+
+    #[test]
     fn stats_include_prompt_cache_reuse() {
         let mut o = ChatOutcome::default();
         // OpenAI-style mid-stream chunk: usage is null.
@@ -356,7 +508,10 @@ mod tests {
                     "timings": {"cache_n": 4200, "prompt_n": 800, "predicted_per_second": 48.5, "prompt_per_second": 1900.0}}),
             &mut o,
         );
-        assert_eq!((o.prompt_tokens, o.completion_tokens, o.cached_tokens), (Some(5000), Some(300), Some(4200)));
+        assert_eq!(
+            (o.prompt_tokens, o.completion_tokens, o.cached_tokens),
+            (Some(5000), Some(300), Some(4200))
+        );
         assert_eq!(o.tok_per_sec, Some(48.5));
         assert_eq!(o.tok_per_sec_source, "server");
         assert_eq!((o.draft_tokens, o.draft_accepted), (None, None));
