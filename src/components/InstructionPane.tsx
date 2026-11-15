@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
-import { cancelExpand, expand, pickProject, refreshFiles, toggleChecked } from "../actions";
-import { fmtBytes } from "../api";
+import { cancelExpand, expand, pickProject, refreshFiles, saveSettings, toggleChecked } from "../actions";
+import { fmtBytes, fmtCtx } from "../api";
 import { set, useStore } from "../store";
 import type { FileEntry } from "../types";
 import { StatusDot } from "./common";
@@ -133,15 +133,24 @@ export function InstructionPane() {
   const status = useStore((s) => s.expandStatus);
   const error = useStore((s) => s.expandError);
   const backend = useStore((s) => s.settings?.claudeBackend ?? "cli");
+  const planner = useStore((s) => s.settings?.plannerBackend ?? "local");
+  const plannerProfile = useStore((s) => s.settings?.plannerProfile ?? "");
+  const autopilot = useStore((s) => s.settings?.autopilot ?? false);
+  const profiles = useStore((s) => s.profiles);
   const cliPath = useStore((s) => s.boot?.cliPath);
   const hasKey = useStore((s) => s.boot?.hasApiKey);
   const running = status === "running";
-  const backendProblem =
-    backend === "cli" && !cliPath
+  const local = planner === "local";
+  const backendProblem = local
+    ? profiles.some((p) => p.id === plannerProfile)
+      ? null
+      : "The planner profile no longer exists. Pick one below or in Settings → Roles."
+    : backend === "cli" && !cliPath
       ? "Claude Code CLI not found on PATH. Install it, or switch to the Anthropic API backend in Settings."
       : backend === "api" && !hasKey
         ? "No Anthropic API key saved. Add one in Settings → Claude."
         : null;
+  const plannerLabel = local ? (profiles.find((p) => p.id === plannerProfile)?.name ?? plannerProfile) : "Claude";
 
   return (
     <section className="pane" aria-label="Instruction">
@@ -183,12 +192,31 @@ export function InstructionPane() {
             Cancel
           </button>
         ) : (
-          <button className="primary" disabled={!root || !instruction.trim()} onClick={() => expand()}>
-            Expand with Claude
+          <button className="primary" disabled={!root || !instruction.trim()} onClick={() => expand()} title={`The planner (${plannerLabel}) writes the spec`}>
+            {local ? "Plan with" : "Expand with Claude"}
           </button>
         )}
+        {local && (
+          <select
+            aria-label="Planner model"
+            value={plannerProfile}
+            disabled={running}
+            onChange={(e) => saveSettings({ plannerProfile: e.target.value })}
+            title="The local model that plans (thinking on). Settings → Roles."
+          >
+            {profiles.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name} · {fmtCtx(p.contextLimit)} ctx
+              </option>
+            ))}
+          </select>
+        )}
+        <label className="row faint" style={{ fontSize: 12, gap: 4 }} title="Implement, verify and review as soon as the spec is written, without the spec review">
+          <input type="checkbox" checked={autopilot} onChange={(e) => saveSettings({ autopilot: e.target.checked })} /> Autopilot
+        </label>
         <span className="faint" style={{ fontSize: 12 }}>
-          {backend === "cli" ? "Claude Code CLI" : "Anthropic API"} · <span className="kbd">Ctrl</span>+<span className="kbd">Enter</span>
+          {local ? "" : backend === "cli" ? "Claude Code CLI · " : "Anthropic API · "}
+          <span className="kbd">Ctrl</span>+<span className="kbd">Enter</span>
         </span>
       </div>
     </section>

@@ -298,6 +298,36 @@ pub fn detect(root: &Path) -> Detected {
     d
 }
 
+/// What a run will verify, for the Spec pane.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyPreview {
+    pub enabled: bool,
+    pub commands: Vec<VerifyCommand>,
+    /// "spec", "detected" or "off".
+    pub source: String,
+    pub detected_from: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+pub fn preview(enabled: bool, spec: &crate::spec::ParsedSpec, root: &Path) -> VerifyPreview {
+    if !enabled {
+        return VerifyPreview {
+            source: "off".into(),
+            ..Default::default()
+        };
+    }
+    let detected = detect(root);
+    let (commands, source) = commands_for(spec, &detected);
+    VerifyPreview {
+        enabled,
+        commands,
+        source: source.into(),
+        detected_from: detected.sources,
+        warnings: if source == "detected" { detected.warnings } else { vec![] },
+    }
+}
+
 /// The commands a run will use: the spec's when it has a Verification section, else detected.
 pub fn commands_for(spec: &crate::spec::ParsedSpec, detected: &Detected) -> (Vec<VerifyCommand>, &'static str) {
     if spec.verification_declared {

@@ -19,7 +19,13 @@ export interface RunView {
   review: T.Review | null;
   reviewStatus: T.PaneStatus;
   reviewStream: string;
+  reviewThinking: string;
   reviewJobId: string;
+  /** Loop progress: the current step and the steps finished so far. */
+  phase: T.StepKind | null;
+  steps: { kind: T.StepKind; label: string; ok: boolean; detail: string }[];
+  /** Output of the verification command that is running (tail). */
+  cmdStream: string;
   startedAt: number;
   spec: string;
   fromHistory: boolean;

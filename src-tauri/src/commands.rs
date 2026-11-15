@@ -154,9 +154,17 @@ pub async fn prepare_implement(
     full_context: Option<Vec<String>>,
     profile_id: String,
 ) -> R<Prepared> {
-    core.prepare(&root, &spec, &context_files, &full_context.unwrap_or_default(), &profile_id)
+    let mut prep = core
+        .prepare(&root, &spec, &context_files, &full_context.unwrap_or_default(), &profile_id)
         .await
-        .map_err(e)
+        .map_err(e)?;
+    let enabled = core.settings().verify_enabled;
+    let spec = prep.spec.clone();
+    let dir = PathBuf::from(&root);
+    prep.verify = tokio::task::spawn_blocking(move || crate::verify::preview(enabled, &spec, &dir))
+        .await
+        .ok();
+    Ok(prep)
 }
 
 #[tauri::command]

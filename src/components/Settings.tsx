@@ -2,12 +2,12 @@ import Editor from "@monaco-editor/react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
 import { saveProfiles, saveSettings, schedulePrepare, schedulePrewarm, switchProfile } from "../actions";
-import { api, errText, fmtBytes } from "../api";
+import { api, errText, fmtBytes, fmtCtx } from "../api";
 import { ask, set, toast, useStore } from "../store";
 import type { HfFile, ModelFileStatus, Profile, ProfileTest, TemplateInfo } from "../types";
 import { Field, useDarkMode } from "./common";
 
-type Tab = "general" | "claude" | "models" | "templates";
+type Tab = "general" | "roles" | "claude" | "models" | "templates";
 
 function DownloadProgress({ id }: { id: string }) {
   const p = useStore((s) => s.downloads[id]);
@@ -88,11 +88,6 @@ function General() {
       <Field label="Load timeout (s)">
         <input type="number" value={s.loadTimeoutSecs} min={30} onChange={(e) => saveSettings({ loadTimeoutSecs: Number(e.target.value) })} />
       </Field>
-      <Field label="Review step" hint="After you accept changes, Claude reviews the applied diff against the spec and can write a follow-up spec.">
-        <label className="row">
-          <input type="checkbox" checked={s.reviewEnabled} onChange={(e) => saveSettings({ reviewEnabled: e.target.checked })} /> Review automatically after accepting
-        </label>
-      </Field>
       <Field
         label="Context outlines"
         hint="Large read-only context files (ticked or mentioned in the spec, not edited) go to the local model as outlines: imports, declarations, signatures and docstrings, with function bodies omitted. Click a file chip in the Spec pane to send that file in full."
@@ -144,6 +139,121 @@ function General() {
             Open
           </button>
         </div>
+      </Field>
+    </div>
+  );
+}
+
+
+function Roles() {
+  const s = useStore((st) => st.settings)!;
+  const profiles = useStore((st) => st.profiles);
+  const planner = profiles.find((p) => p.id === s.plannerProfile);
+  const coder = profiles.find((p) => p.id === s.coderProfile);
+  const swaps = s.plannerBackend === "local" && planner && coder && planner.id !== coder.id;
+  const loadSecs = (id: string | undefined) => (id && s.loadStats[id] ? `≈${Math.round(s.loadStats[id])}s` : "unmeasured");
+  const profileSelect = (value: string, onChange: (id: string) => void, label: string) => (
+    <select aria-label={label} value={value} onChange={(e) => onChange(e.target.value)}>
+      {profiles.map((p) => (
+        <option key={p.id} value={p.id}>
+          {p.name} · {fmtCtx(p.contextLimit)} ctx
+        </option>
+      ))}
+    </select>
+  );
+  return (
+    <div className="form">
+      <Field label="Planner" hint="Writes the spec from your instruction, and reviews the verified change. A local planner runs with thinking on.">
+        <div className="row wrap">
+          <label className="row">
+            <input type="radio" checked={s.plannerBackend === "local"} onChange={() => saveSettings({ plannerBackend: "local" })} /> Local model
+          </label>
+          <label className="row">
+            <input type="radio" checked={s.plannerBackend === "claude"} onChange={() => saveSettings({ plannerBackend: "claude" })} /> Claude (see the Claude tab)
+          </label>
+        </div>
+      </Field>
+      {s.plannerBackend === "local" && (
+        <>
+          <Field label="Planner model">{profileSelect(s.plannerProfile, (id) => saveSettings({ plannerProfile: id }), "Planner model")}</Field>
+          <Field
+            label="Planner effort"
+            hint="For models with a reasoning-effort switch (gpt-oss). Qwen models just think with thinking enabled."
+          >
+            <select value={s.plannerEffort} onChange={(e) => saveSettings({ plannerEffort: e.target.value })}>
+              {["low", "medium", "high"].map((x) => (
+                <option key={x}>{x}</option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Project tools" hint="Lets the planner call read_file, list_files and search (read-only, inside the project) before it writes the spec or review.">
+            <label className="row">
+              <input type="checkbox" checked={s.plannerTools} onChange={(e) => saveSettings({ plannerTools: e.target.checked })} /> Allow read-only tools
+            </label>
+          </Field>
+        </>
+      )}
+      <Field label="Coder model" hint="Writes the code (thinking off). The default for new runs; the Spec pane can pick another per run.">
+        {profileSelect(
+          s.coderProfile,
+          (id) => {
+            saveSettings({ coderProfile: id });
+            set({ implementProfile: id });
+            schedulePrepare(0);
+          },
+          "Coder model",
+        )}
+      </Field>
+      {swaps && (
+        <div className="note warn">
+          Planner and coder use different models, and only one fits in VRAM: Relay unloads one and loads the other at every hand-off (planner {loadSecs(planner?.id)}, coder {loadSecs(coder?.id)} to load).
+        </div>
+      )}
+      <Field
+        label="Verification"
+        hint="The change is applied to a staging copy of the project (in the data folder), where the spec's build / test / run commands run. A failure goes back to the coder with the condensed output."
+      >
+        <label className="row">
+          <input
+            type="checkbox"
+            checked={s.verifyEnabled}
+            onChange={(e) => {
+              void saveSettings({ verifyEnabled: e.target.checked }).then(() => schedulePrepare(0));
+            }}
+          />{" "}
+          Build, test and run the change before showing it
+        </label>
+      </Field>
+      <Field label="Fix rounds" hint="How often the coder may try to fix a failing command.">
+        <input type="number" min={0} max={8} value={s.maxFixRounds} onChange={(e) => saveSettings({ maxFixRounds: Math.max(0, Number(e.target.value)) })} />
+      </Field>
+      <Field label="Timeouts (s)" hint="Setup, build and test commands fail when they take longer. A run command still running at its timeout counts as started fine (games, servers).">
+        <div className="row wrap">
+          <label className="row" style={{ gap: 4 }}>
+            <span className="faint">build/test</span>
+            <input type="number" min={10} style={{ width: 80 }} value={s.buildTimeoutSecs} onChange={(e) => saveSettings({ buildTimeoutSecs: Number(e.target.value) })} />
+          </label>
+          <label className="row" style={{ gap: 4 }}>
+            <span className="faint">run</span>
+            <input type="number" min={1} style={{ width: 80 }} value={s.runTimeoutSecs} onChange={(e) => saveSettings({ runTimeoutSecs: Number(e.target.value) })} />
+          </label>
+        </div>
+      </Field>
+      <Field label="Review" hint="The planner reviews the diff and the verification results against the spec. If it finds problems, its follow-up spec goes back to the coder.">
+        <div className="row wrap">
+          <label className="row">
+            <input type="checkbox" checked={s.loopReview} onChange={(e) => saveSettings({ loopReview: e.target.checked })} /> Review before showing the result
+          </label>
+          <label className="row" style={{ gap: 4 }}>
+            <span className="faint">follow-up passes</span>
+            <input type="number" min={0} max={4} style={{ width: 60 }} value={s.followUpRounds} onChange={(e) => saveSettings({ followUpRounds: Math.max(0, Number(e.target.value)) })} />
+          </label>
+        </div>
+      </Field>
+      <Field label="Autopilot" hint="Start implementing as soon as the spec is written, without the spec review. The diff still waits for you to accept it.">
+        <label className="row">
+          <input type="checkbox" checked={s.autopilot} onChange={(e) => saveSettings({ autopilot: e.target.checked })} /> Skip the spec review
+        </label>
       </Field>
     </div>
   );
@@ -451,6 +561,39 @@ function ProfileEditor({ p, onChange }: { p: Profile; onChange: (p: Profile) => 
             ))}
           </div>
         </Field>
+        <Field label="Planner sampling" hint="Used when this profile plans or reviews (thinking on). Off: the coder sampling above.">
+          <div className="row wrap">
+            <label className="row" style={{ gap: 4 }}>
+              <input
+                type="checkbox"
+                checked={!!p.thinkingSampling}
+                onChange={(e) => up({ thinkingSampling: e.target.checked ? { ...p.sampling, temperature: 0.6, topP: 0.95 } : null })}
+              />
+              <span className="faint">own values</span>
+            </label>
+            {p.thinkingSampling &&
+              (
+                [
+                  ["temperature", "temp"],
+                  ["topP", "top_p"],
+                  ["topK", "top_k"],
+                  ["minP", "min_p"],
+                  ["presencePenalty", "presence"],
+                ] as const
+              ).map(([k, label]) => (
+                <label key={k} className="row" style={{ gap: 4 }}>
+                  <span className="faint">{label}</span>
+                  <input
+                    type="number"
+                    step="0.05"
+                    style={{ width: 70 }}
+                    value={p.thinkingSampling![k]}
+                    onChange={(e) => up({ thinkingSampling: { ...p.thinkingSampling!, [k]: num(e.target.value) } })}
+                  />
+                </label>
+              ))}
+          </div>
+        </Field>
         <Field
           label="Reasoning"
           hint={
@@ -629,9 +772,11 @@ function Templates() {
   }, []);
   const cur = list.find((t) => t.name === sel);
   const desc: Record<string, string> = {
-    "expand.md": "Turns your instruction into the spec (Claude). Placeholders: {{instruction}} {{model_name}} {{context_limit}} {{project_name}} {{file_tree}} {{context_files}} {{explore_note}} {{budget_guidance}}",
-    "implement-system.md": "System prompt for the local model: the SEARCH/REPLACE edit format rules.",
-    "review.md": "Review prompt (Claude). Placeholders: {{spec}} {{diff}} {{files_after}}",
+    "expand.md":
+      "Turns your instruction into the spec (planner: local model or Claude). Placeholders: {{instruction}} {{model_name}} {{context_limit}} {{project_name}} {{file_tree}} {{context_files}} {{project_outline}} {{explore_note}} {{budget_guidance}} {{verification_defaults}}",
+    "implement-system.md": "System prompt for the coder: the SEARCH/REPLACE edit format rules.",
+    "review.md": "Review prompt (planner). Placeholders: {{spec}} {{diff}} {{files_after}} {{verification}}",
+    "fix.md": "The coder's fix round after a failed build / test / run. Placeholders: {{files}} {{spec}} {{failure}}",
   };
   return (
     <div className="col" style={{ gap: 8, flex: 1, minHeight: 0, height: "100%" }}>
@@ -695,6 +840,7 @@ export function SettingsDialog() {
   if (!open || !settings) return null;
   const tabs: [Tab, string][] = [
     ["general", "General"],
+    ["roles", "Roles & loop"],
     ["claude", "Claude"],
     ["models", "Local models"],
     ["templates", "Prompt templates"],
@@ -721,6 +867,7 @@ export function SettingsDialog() {
           </nav>
           <div className="settings-main">
             {tab === "general" && <General />}
+            {tab === "roles" && <Roles />}
             {tab === "claude" && <Claude />}
             {tab === "models" && <Models />}
             {tab === "templates" && <Templates />}

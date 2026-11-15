@@ -2,7 +2,7 @@ import Editor from "@monaco-editor/react";
 import { cancelRun, implement, schedulePrepare, schedulePrewarm, setSpec, toggleFullContext } from "../actions";
 import { fmtCtx, fmtTokens } from "../api";
 import { set, useStore } from "../store";
-import type { Prepared } from "../types";
+import type { Prepared, VerifyPreview } from "../types";
 import { StatusDot, useDarkMode } from "./common";
 
 const SKELETON = `## Summary
@@ -26,6 +26,10 @@ Everything the file must contain (imports, constants, functions with signatures)
 
 ## Acceptance criteria
 - …
+
+## Verification
+- build: \`command that builds the project\`
+- test: \`command that runs the tests\`
 `;
 
 /** Show tool activity paths relative to the project root. */
@@ -36,6 +40,42 @@ function relToRoot(text: string, root: string): string {
   const t = norm(text);
   const i = t.toLowerCase().indexOf(r.toLowerCase());
   return i >= 0 ? t.slice(0, i) + t.slice(i + r.length) : text;
+}
+
+function Verification({ v }: { v: VerifyPreview }) {
+  const source = v.source === "spec" ? "from the spec's Verification section" : v.source === "detected" ? `detected from ${v.detectedFrom.join(", ") || "the project"}` : "";
+  return (
+    <div className="col">
+      <span className="section-label">Verification</span>
+      {!v.enabled ? (
+        <span className="faint" style={{ fontSize: 12 }}>
+          Off (Settings → Roles): the change is not built or tested before you see it.
+        </span>
+      ) : v.commands.length === 0 ? (
+        <span className="faint" style={{ fontSize: 12 }}>
+          Nothing to run{v.source === "spec" ? " (the spec says nothing can be checked)" : " — no build or test setup detected; add a ## Verification section to the spec"}.
+        </span>
+      ) : (
+        <>
+          <div className="chips">
+            {v.commands.map((c, i) => (
+              <span key={i} className="chip ctx mono" title={`${c.kind}${c.timeoutSecs ? ` · timeout ${c.timeoutSecs}s` : ""}${c.expect ? ` · output must contain "${c.expect}"` : ""}`}>
+                <b>{c.kind}</b> {c.command}
+              </span>
+            ))}
+          </div>
+          <span className="faint" style={{ fontSize: 12 }}>
+            Run in a staging copy of the project, {source}. Failures go back to the coder.
+          </span>
+        </>
+      )}
+      {v.warnings.map((w, i) => (
+        <div key={i} className="note warn">
+          {w}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function Budget({ prepared }: { prepared: Prepared }) {
@@ -141,12 +181,12 @@ export function SpecPane() {
               </div>
             )}
             <pre className="stream" aria-live="polite">
-              {stream || (thinking ? `(thinking) ${thinking.slice(-600)}` : "Waiting for Claude…")}
+              {stream || (thinking ? `(thinking) ${thinking.slice(-600)}` : info || "Waiting for the planner…")}
             </pre>
           </>
         ) : !spec && status !== "running" ? (
           <div className="empty">
-            <div>Expand an instruction with Claude, or write a spec yourself.</div>
+            <div>Let the planner turn an instruction into a spec, or write one yourself.</div>
             <button onClick={() => setSpec(SKELETON)}>Start from the spec template</button>
           </div>
         ) : (
@@ -194,6 +234,7 @@ export function SpecPane() {
                 {prepared.files.length === 0 && <span className="faint">No files found in the spec's Files section.</span>}
               </div>
             </div>
+            {prepared.verify && <Verification v={prepared.verify} />}
             <Budget prepared={prepared} />
             {prepared.warnings.filter((w) => !prepared.budget.warnings.includes(w)).length > 0 && (
               <div className="note warn">
@@ -215,7 +256,7 @@ export function SpecPane() {
             Cancel run
           </button>
         ) : (
-          <button className="primary" disabled={!spec.trim() || streaming || !root} onClick={() => implement()}>
+          <button className="primary" disabled={!spec.trim() || streaming || !root} onClick={() => implement()} title="The coder writes the code; then it is verified and reviewed">
             Implement with
           </button>
         )}
@@ -235,7 +276,7 @@ export function SpecPane() {
           ))}
         </select>
         <span className="faint" style={{ fontSize: 12 }}>
-          switches models if needed
+          coder · switches models if needed
         </span>
       </div>
     </section>

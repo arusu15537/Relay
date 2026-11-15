@@ -20,7 +20,13 @@ window can stay in the background (no screen capture, no mouse).
    node tools\uitest\uitest-claude.mjs C:\tmp\shots   :: real Claude CLI expansion + review (fake local model)
    node tools\uitest\uitest-prewarm.mjs C:\tmp\shots  :: exact token counts + prewarm (needs a `fake-recurrent` profile, see below)
    node tools\uitest\uitest-real.mjs   C:\tmp\shots   :: real Claude + all three real models (GPU)
+   node tools\uitest\uitest-loop.mjs   C:\tmp\shots   :: local planner (tool call) → verification chips → build fails → fix → review → follow-up → PASS → accept; autopilot
    ```
+
+`uitest-loop.mjs` scripts the fake server's answers: start Relay with `$env:FAKE_LLM_SCRIPT = "$env:TEMP\relay-uitest\fake-script.json"`
+(the scenario writes its rules there and empties the file afterwards). It uses its own project in `%TEMP%\relay-uitest\loop-project`
+and switches back to the previous project at the end. The other fake scenarios turn verification and the loop review off, so they
+test the plain implement path.
 
 For the fake scenarios, point `llamaServerPath` at `tools\fake-llama-server\target\release\fake-llama-server.exe`
 and give each profile a dummy `.gguf` file. Extra flags such as `--fake-tps 60 --fake-reasoning` go in the profile's

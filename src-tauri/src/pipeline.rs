@@ -102,6 +102,9 @@ pub struct Prepared {
     pub files: Vec<PreparedFile>,
     pub budget: BudgetPlan,
     pub warnings: Vec<String>,
+    /// The commands a run will verify the change with (filled in for the UI).
+    #[serde(default)]
+    pub verify: Option<crate::verify::VerifyPreview>,
     /// Text sent to the model per file: targets in full, context files in full or as an outline.
     #[serde(skip)]
     contents: Vec<(String, Option<String>)>,
@@ -347,6 +350,7 @@ pub fn prepare_with(
         files,
         budget,
         warnings,
+        verify: None,
         contents,
     }
 }

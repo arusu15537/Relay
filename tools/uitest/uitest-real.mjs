@@ -21,6 +21,7 @@ try {
   await c.type("textarea.instruction", "add a retry with backoff to the HTTP client");
   await c.ev(`(() => { const row = [...document.querySelectorAll('.tree-row')].find(r => r.textContent.includes('http_client.py')); row.querySelector('input').click(); return true; })()`);
   const t0 = Date.now();
+  await c.ev("window.__relay.actions.saveSettings({ plannerBackend: 'claude', verifyEnabled: false, loopReview: false })");
   await c.click("Expand with Claude");
   await c.wait(`${S}.expandStatus !== 'running' && ${S}.expandStatus !== 'idle'`, 600000, "expansion");
   check((await c.state("s.expandStatus")) === "done", `Claude spec in ${((Date.now() - t0) / 1000).toFixed(0)}s: ${await c.state("s.expandInfo")}`);

@@ -860,3 +860,51 @@ details.calls summary {
   padding: 6px 8px;
   background: var(--panel-2);
 }
+
+/* Loop progress: implement → verify ⇄ fix → review → follow-up */
+.steps {
+  list-style: none;
+  margin: 4px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+}
+.steps li {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  min-width: 0;
+}
+.steps li .icon {
+  width: 16px;
+  text-align: center;
+  flex: none;
+}
+.steps li .faint {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.steps .okmark {
+  color: var(--ok);
+}
+.steps .badmark {
+  color: var(--err);
+}
+details.cmd {
+  font-size: 12px;
+}
+details.cmd pre {
+  max-height: 240px;
+  overflow: auto;
+  margin: 4px 0;
+  padding: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  color: var(--text);
+}

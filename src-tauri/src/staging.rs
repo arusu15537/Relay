@@ -112,6 +112,16 @@ fn walk(root: &Path) -> Result<BTreeSet<String>> {
     Ok(out)
 }
 
+/// `canonicalize` returns verbatim paths (`\\?\C:\...`) on Windows; cmd.exe, npm and other build
+/// tools mishandle them as a working directory, so plain drive paths are used.
+fn plain(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => p,
+    }
+}
+
 fn same_file(src: &std::fs::Metadata, dst: &std::fs::Metadata) -> bool {
     src.len() == dst.len()
         && match (src.modified(), dst.modified()) {
@@ -128,11 +138,13 @@ impl Staging {
 
     /// A mirror in `dir` (tests use a temporary directory).
     pub fn at(project: &Path, dir: &Path) -> Result<Self> {
-        let project = project
-            .canonicalize()
-            .with_context(|| format!("project folder {}", project.display()))?;
+        let project = plain(
+            project
+                .canonicalize()
+                .with_context(|| format!("project folder {}", project.display()))?,
+        );
         std::fs::create_dir_all(dir)?;
-        let dir = dir.canonicalize()?;
+        let dir = plain(dir.canonicalize()?);
         let root = dir.join("src");
         if root.starts_with(&project) || project.starts_with(&dir) {
             bail!(
@@ -341,5 +353,8 @@ mod tests {
         let s = Staging::at(p.path(), w.path()).unwrap();
         assert_eq!(s.sync().unwrap().files, 1);
         assert_eq!(key_for(Path::new(r"C:\Users\x\My Game")).len(), "My_Game-".len() + 10);
+        assert!(!s.root.to_string_lossy().starts_with(r"\\?\"), "plain path: {}", s.root.display());
+        assert_eq!(plain(PathBuf::from(r"\\?\C:\a\b")), PathBuf::from(r"C:\a\b"));
+        assert_eq!(plain(PathBuf::from(r"\\?\UNC\srv\share")), PathBuf::from(r"\\?\UNC\srv\share"));
     }
 }
