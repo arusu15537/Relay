@@ -852,7 +852,14 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                     );
                     c.check(
                         ex.parsed.warnings.is_empty(),
-                        format!("spec structure ok: {:?}", ex.parsed.warnings),
+                        format!("spec structure ok, no code: {:?}", ex.parsed.warnings),
+                    );
+                    c.check(
+                        ex.parsed.design.contains('(') && ex.parsed.design.lines().count() >= 3,
+                        format!(
+                            "spec has a class-diagram-level Design section ({} lines)",
+                            ex.parsed.design.lines().count()
+                        ),
                     );
                     let resp = core
                         .implement(ImplementCommand {

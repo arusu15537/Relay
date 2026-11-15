@@ -8,7 +8,7 @@ You are reviewing code changes that a smaller local model made to implement a sp
 
 {{files_after}}
 
-Check the changes against the spec: correctness, bugs, missed requirements, unhandled edge cases, acceptance criteria, syntax or type errors, and changes the spec did not ask for.
+Check the changes against the spec: correctness, bugs, missed requirements, unhandled edge cases, acceptance criteria, syntax or type errors, deviations from the Design (names, signatures, responsibilities, relationships, contracts), and changes the spec did not ask for. Do not write code in your answer.
 
 Respond in Markdown with exactly these sections:
 
@@ -22,4 +22,4 @@ If the verdict is NEEDS_FIXES, end your answer with a line containing exactly
 
 === FOLLOW-UP SPEC ===
 
-followed by a complete follow-up spec that fixes only the problems, written against the CURRENT code (after the diff above), using exactly these sections: `## Summary`, `## Files` (bullets: `path` (modify|create) — purpose), `## Changes` (one `### `path`` subsection per file, self-contained, with exact locations, signatures and precise step-by-step descriptions — describe the fix in words, do not write the code), `## Edge cases`, `## Acceptance criteria`. The implementing model only sees that spec and the listed files, so be explicit; it writes all of the code itself.
+followed by a complete follow-up spec that fixes only the problems, written against the CURRENT code (after the diff above), using exactly these sections: `## Summary`, `## Design` (the elements involved in the fix at class-diagram level: responsibilities, exact signatures, relationships, and the contract each must meet), `## Files` (bullets: `path` (modify|create) — purpose), `## Changes` (one `### `path`` subsection per file, self-contained: which element changes, where, and what it must guarantee afterwards), `## Edge cases`, `## Acceptance criteria`. Describe what must hold, not how: do not write the code, pseudo-code or step-by-step logic. The implementing model only sees that spec and the listed files and writes all of the code itself.
