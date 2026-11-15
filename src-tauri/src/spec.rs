@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! ## Summary
+//! ## Design            (types, responsibilities, signatures, relationships, decisions)
 //! ## Files
 //! - `src/a.ts` (modify) — why
 //! - `src/b.ts` (create) — why
@@ -39,6 +40,9 @@ pub struct SpecFile {
 #[serde(rename_all = "camelCase")]
 pub struct ParsedSpec {
     pub summary: String,
+    /// The class-diagram-level design (shared by every per-file call).
+    #[serde(default)]
+    pub design: String,
     pub files: Vec<SpecFile>,
     /// (path, section text) for each `### path` subsection under Changes, in order.
     pub changes: Vec<(String, String)>,
@@ -50,18 +54,34 @@ pub struct ParsedSpec {
 }
 
 /// A fenced block with at least this many non-blank lines counts as code (a one- or two-line
-/// fence holding a signature or a literal value is fine).
+/// fence holding a signature or a literal value is fine). Mermaid diagrams are not code.
 pub const CODE_BLOCK_MIN_LINES: usize = 3;
 
 static BACKTICK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`\n]+)`").unwrap());
 static ACTION_TAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\((?:modify|create|new|edit|delete|remove|update|new file)\)").unwrap());
 static HEADING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(#{1,6})\s+(.+?)\s*#*\s*$").unwrap());
+static CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z_][\w.]*\s*\(").unwrap());
+static IDENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z_][\w.]*").unwrap());
+
+/// Is this inline code span an implementation (an expression or call chain) rather than a name,
+/// signature, type or literal value? Flags calls nested in calls, calls combined with arithmetic,
+/// `**`, and arithmetic between two or more names. A quantity such as `max_retries + 1` and
+/// signatures with type annotations or defaults are fine.
+pub fn is_code_expression(span: &str) -> bool {
+    let s = span.trim();
+    let annotated = s.contains("->") || s.contains(": ");
+    let arithmetic = [" * ", " + ", " - ", " / ", " % "].iter().any(|op| s.contains(op));
+    let nested_call = !annotated && s.matches('(').count() >= 2;
+    let names = IDENT.find_iter(s).count();
+    nested_call || s.contains("**") || (!annotated && arithmetic && (CALL.is_match(s) || names >= 2))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
     Preamble,
     Summary,
+    Design,
     Files,
     Changes,
     EdgeCases,
@@ -73,6 +93,8 @@ fn classify(title: &str) -> Section {
     let t = title.trim().trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase();
     if t.starts_with("summary") || t == "overview" || t == "goal" {
         Section::Summary
+    } else if t.starts_with("design") || t.starts_with("architecture") {
+        Section::Design
     } else if t.starts_with("files") || t == "file list" || t.starts_with("files to") {
         Section::Files
     } else if t.starts_with("changes") || t.starts_with("implementation") || t.starts_with("step") {
@@ -149,14 +171,17 @@ pub fn parse_spec(md: &str) -> ParsedSpec {
     let mut section = Section::Preamble;
     let mut top_level: Option<usize> = None; // heading level used for top sections
     let mut summary = Vec::new();
+    let mut design = Vec::new();
     let mut edge = Vec::new();
     let mut acc = Vec::new();
     let mut current_change: Option<(String, Vec<String>)> = None;
     let mut in_fence = false;
+    let mut fence_is_diagram = false;
     // Code in the spec: (blocks with at least CODE_BLOCK_MIN_LINES lines, their total lines).
     let mut fence_lines = 0usize;
     let mut code_blocks = 0usize;
     let mut code_lines = 0usize;
+    let mut expressions: Vec<String> = Vec::new();
 
     let flush_change = |spec: &mut ParsedSpec, cur: &mut Option<(String, Vec<String>)>| {
         if let Some((p, body)) = cur.take() {
@@ -166,14 +191,21 @@ pub fn parse_spec(md: &str) -> ParsedSpec {
 
     for line in text.lines() {
         if line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~") {
-            if in_fence && fence_lines >= CODE_BLOCK_MIN_LINES {
+            if in_fence && fence_lines >= CODE_BLOCK_MIN_LINES && !fence_is_diagram {
                 code_blocks += 1;
                 code_lines += fence_lines;
             }
             in_fence = !in_fence;
+            fence_is_diagram = in_fence && line.trim_start()[3..].trim().eq_ignore_ascii_case("mermaid");
             fence_lines = 0;
         } else if in_fence && !line.trim().is_empty() {
             fence_lines += 1;
+        } else if !in_fence {
+            for cap in BACKTICK.captures_iter(line) {
+                if is_code_expression(&cap[1]) && !expressions.iter().any(|e| e == &cap[1]) {
+                    expressions.push(cap[1].to_string());
+                }
+            }
         }
         if !in_fence && let Some(cap) = HEADING.captures(line) {
             let level = cap[1].len();
@@ -201,6 +233,7 @@ pub fn parse_spec(md: &str) -> ParsedSpec {
         }
         match section {
             Section::Summary => summary.push(line),
+            Section::Design => design.push(line),
             Section::Files => {
                 let t = line.trim_start();
                 let item = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")).or_else(|| {
@@ -244,6 +277,7 @@ pub fn parse_spec(md: &str) -> ParsedSpec {
     }
     flush_change(&mut spec, &mut current_change);
     spec.summary = summary.join("\n").trim().to_string();
+    spec.design = design.join("\n").trim().to_string();
     spec.edge_cases = edge.join("\n").trim().to_string();
     spec.acceptance = acc.join("\n").trim().to_string();
 
@@ -263,8 +297,17 @@ pub fn parse_spec(md: &str) -> ParsedSpec {
 
     if code_blocks > 0 {
         spec.warnings.push(format!(
-            "The spec contains code ({code_lines} lines in {code_blocks} block(s)). Specs should describe the changes in words, names and signatures; \
-             the local model is meant to write the code. Remove the code or regenerate the spec."
+            "The spec contains code ({code_lines} lines in {code_blocks} block(s)). Specs describe the design (types, responsibilities, signatures, \
+             relationships, contracts); the local model writes all of the code. Remove the code or regenerate the spec."
+        ));
+    }
+    if !expressions.is_empty() {
+        let shown: Vec<String> = expressions.iter().take(3).map(|e| format!("`{e}`")).collect();
+        spec.warnings.push(format!(
+            "The spec writes {} expression(s) in code syntax ({}{}). Specs state rules in words; the local model writes the code.",
+            expressions.len(),
+            shown.join(", "),
+            if expressions.len() > 3 { ", …" } else { "" }
         ));
     }
     if spec.files.is_empty() {
@@ -288,6 +331,11 @@ pub fn per_file_spec(spec: &ParsedSpec, path: &str) -> String {
     if !spec.summary.is_empty() {
         out.push_str("## Summary\n");
         out.push_str(&spec.summary);
+        out.push_str("\n\n");
+    }
+    if !spec.design.is_empty() {
+        out.push_str("## Design\n");
+        out.push_str(&spec.design);
         out.push_str("\n\n");
     }
     let others: Vec<String> = spec
@@ -452,6 +500,63 @@ Export it.
         let signature_only = "## Files\n- `a.py` (modify)\n## Changes\n### `a.py`\nAdd a function:\n```python\ndef f(x: int) -> int\n```\nthat returns 1 for truthy `x`, else 2.\n";
         let s = parse_spec(signature_only);
         assert!(!s.warnings.iter().any(|w| w.contains("contains code")), "{:?}", s.warnings);
+    }
+
+    const DESIGN_SPEC: &str = "## Summary\nRetries for the client.\n\n## Design\n### Elements\n- `RetryPolicy` (new, frozen dataclass): `max_attempts: int = 3`, `delay(attempt: int) -> float`.\n- `HttpClient` (changed): owns a `RetryPolicy`; `fetch(path: str) -> Response` raises `HttpError` after the last attempt.\n### Decisions\n- Policy object instead of loose arguments, so tests can inject one.\n\n```mermaid\nclassDiagram\n  HttpClient *-- RetryPolicy\n  class RetryPolicy {\n    +max_attempts: int\n    +delay(attempt: int) float\n  }\n```\n\n## Files\n- `client.py` (modify) — use the policy\n- `retry.py` (create) — the policy\n\n## Changes\n### `client.py`\n`HttpClient.__init__` takes `policy: RetryPolicy | None = None`.\n### `retry.py`\nDefines `RetryPolicy` as in the Design.\n\n## Edge cases\n- `max_attempts` below 1 is rejected with `ValueError`.\n\n## Acceptance criteria\n- Three attempts by default.\n";
+
+    #[test]
+    fn design_section_is_parsed_and_shared_by_every_per_file_call() {
+        let s = parse_spec(DESIGN_SPEC);
+        assert!(s.design.starts_with("### Elements"), "{}", s.design);
+        assert!(s.design.contains("classDiagram") && s.design.contains("Policy object instead of loose arguments"));
+        assert!(!s.summary.contains("RetryPolicy"), "the design must not leak into the summary");
+        assert_eq!(s.files.len(), 2);
+        assert!(s.warnings.is_empty(), "a Mermaid class diagram is not code: {:?}", s.warnings);
+        for f in ["client.py", "retry.py"] {
+            let p = per_file_spec(&s, f);
+            let (summary, design, changes) = (p.find("## Summary").unwrap(), p.find("## Design").unwrap(), p.find("## Changes for").unwrap());
+            assert!(summary < design && design < changes, "{p}");
+            assert!(p.contains("`delay(attempt: int) -> float`"), "{f} must see the shared signatures");
+        }
+        // Without a Design section nothing changes.
+        assert!(!per_file_spec(&parse_spec(SPEC), "src/http/retry.ts").contains("## Design"));
+        // Code is still flagged, also inside the Design section.
+        let with_code = DESIGN_SPEC.replace("```mermaid\nclassDiagram", "```python\nclass RetryPolicy:");
+        assert!(parse_spec(&with_code).warnings.iter().any(|w| w.contains("contains code")));
+    }
+
+    #[test]
+    fn expressions_in_code_syntax_are_flagged() {
+        // Real leaks from a Claude spec (2026-11-15) ...
+        for e in [
+            "min(self.max_backoff, self.backoff_factor * 2 ** attempt)",
+            "self._sleep(self._backoff_delay(attempt))",
+            "sleep(base_delay * 2 ** counter)",
+            "delay * factor",
+            "len(items) - 1",
+        ] {
+            assert!(is_code_expression(e), "{e}");
+        }
+        // ... and what a design spec legitimately writes inline.
+        for ok in [
+            "max_retries + 1",
+            "__init__(self, base_url: str, timeout: float = 10, sleep: Callable[[float], None] = time.sleep) -> None",
+            "retry_with_backoff(fn, retries=3, base_delay=0.5, should_retry=lambda exc: True, sleep=time.sleep)",
+            "frozenset({429, 500, 502, 503, 504})",
+            "RETRY_STATUSES: frozenset[int]",
+            "urllib.error.HTTPError",
+            "_backoff_delay(self, retry_number: int) -> float",
+            "Content-Type: application/json",
+            "0.5, 1.0, 2.0",
+        ] {
+            assert!(!is_code_expression(ok), "{ok}");
+        }
+        let s = parse_spec("## Files\n- `a.py` (modify)\n## Changes\n### `a.py`\nWait `self._sleep(self._backoff_delay(n))` between at most `max_retries + 1` attempts.\n");
+        assert!(
+            s.warnings.iter().any(|w| w.contains("1 expression(s) in code syntax (`self._sleep(self._backoff_delay(n))`)")),
+            "{:?}",
+            s.warnings
+        );
     }
 
     #[test]

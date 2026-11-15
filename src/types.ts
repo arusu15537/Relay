@@ -122,6 +122,8 @@ export interface SpecFile {
 
 export interface ParsedSpec {
   summary: string;
+  /** Class-diagram-level design, shared by every per-file call. */
+  design?: string;
   files: SpecFile[];
   changes: [string, string][];
   edgeCases: string;

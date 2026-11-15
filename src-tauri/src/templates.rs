@@ -159,6 +159,8 @@ mod tests {
             "the expand template must forbid code"
         );
         assert!(!e.contains("include the code"), "the expand template must not invite code");
+        assert!(e.contains("## Design") && e.contains("class diagram"), "specs are design-level");
+        assert!(e.contains("no pseudo-code"), "no algorithms written as prose either");
         assert!(Template::Review.default_text().contains("=== FOLLOW-UP SPEC ==="));
         assert!(Template::Review.default_text().contains("do not write the code"));
         assert!(Template::ImplementSystem.default_text().contains("<<<<<<< SEARCH"));

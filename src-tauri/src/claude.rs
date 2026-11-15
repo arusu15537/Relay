@@ -540,7 +540,7 @@ pub fn budget_guidance(profile: &Profile, context_file_tokens: u32) -> String {
         "- Keep the whole spec under about {spec_target} tokens; be precise rather than long.\n"
     ));
     if context_file_tokens > per_call_files / 2 || ctx <= 32768 {
-        g.push_str("- The job may be split into one call per file. In that case each call sees only the Summary, its own `### path` subsection under Changes, Edge cases and Acceptance criteria, plus that single file. Make every file's subsection fully self-contained and restate any cross-file names and signatures it needs.\n");
+        g.push_str("- The job may be split into one call per file. In that case each call sees only the Summary, the Design, its own `### path` subsection under Changes, Edge cases and Acceptance criteria, plus that single file. Put every cross-file name and signature in the Design so all calls agree on them, and make each file's subsection self-contained otherwise.\n");
         g.push_str("- Prefer touching few files. Avoid sweeping changes to very large files; target the specific functions.\n");
     }
     if context_file_tokens > per_call_files {
