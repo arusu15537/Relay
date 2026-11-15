@@ -273,5 +273,6 @@ tools/uitest/             CDP-driven UI scenarios
 ## Troubleshooting
 
 * **`CUDA error: shared object initialization failed` / out of memory / very slow generation** — another program holds VRAM (games, browsers with hardware acceleration). Check the VRAM readout in the toolbar; close the app or use a profile with a smaller footprint (raise `--n-cpu-moe`, lower the context).
+* **Claude's spec contains code / looks like an older format** — you are probably running an old build. Settings shows `Relay <version> · <commit> <date>` in its header; compare it with `git log -1`. Rebuild with `npm run tauri build` (or run the new installer) after pulling changes. On first start a new build replaces prompt templates you never edited with the new defaults; edited ones are kept (Settings → Prompt templates → *Reset to default* restores it).
 * **"Claude Code CLI not found"** — make sure `claude --version` works in a new terminal, then restart Relay.
 * **Validation keeps failing** — open *Model calls* in the Result pane to see each attempt's raw output and the exact mismatch; try per-file mode, a tighter spec, or gpt-oss-20b.
