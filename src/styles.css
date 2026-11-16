@@ -446,6 +446,10 @@ button.chip {
   letter-spacing: 0.03em;
   color: var(--accent);
 }
+.chip.warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
 .chip.err {
   border-color: var(--err);
   color: var(--err);

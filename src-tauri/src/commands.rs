@@ -173,6 +173,14 @@ pub async fn prewarm(core: Core<'_>, cmd: crate::app::PrewarmCommand) -> R<crate
 }
 
 #[tauri::command]
+pub async fn autopilot_check(core: Core<'_>, root: String, spec: String) -> R<crate::app::AutopilotCheck> {
+    let core = core.inner().clone();
+    tokio::task::spawn_blocking(move || core.autopilot_check(&root, &spec))
+        .await
+        .map_err(e)
+}
+
+#[tauri::command]
 pub async fn implement(core: Core<'_>, cmd: ImplementCommand) -> R<ImplementResponse> {
     core.implement(cmd).await.map_err(e)
 }

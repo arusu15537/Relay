@@ -15,6 +15,7 @@ pub mod planner;
 pub mod prewarm;
 pub mod project;
 pub mod reasoning;
+pub mod sandbox;
 pub mod server;
 pub mod spec;
 pub mod staging;
@@ -68,6 +69,7 @@ pub fn run() {
             commands::prepare_implement,
             commands::prewarm,
             commands::implement,
+            commands::autopilot_check,
             commands::cancel_job,
             commands::accept_file,
             commands::reject_file,

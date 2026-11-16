@@ -70,6 +70,11 @@ pub struct Settings {
     pub run_timeout_secs: u64,
     /// Start implementing as soon as the spec is written, without the spec review.
     pub autopilot: bool,
+    /// Autopilot secure mode: an autopilot run only starts when every verification command is
+    /// on the allowlist (else it stops at the spec), and its commands run sandboxed.
+    pub autopilot_secure: bool,
+    /// Sandbox the verification of every run, also runs whose spec was reviewed.
+    pub sandbox_all_runs: bool,
     pub claude_backend: ClaudeBackend,
     pub claude_model: String,
     /// Effort for Claude (`--effort` on the CLI, `output_config.effort` on the API).
@@ -110,6 +115,8 @@ impl Default for Settings {
             build_timeout_secs: 900,
             run_timeout_secs: 10,
             autopilot: false,
+            autopilot_secure: true,
+            sandbox_all_runs: false,
             claude_backend: ClaudeBackend::Cli,
             claude_model: "claude-opus-5-5".into(),
             claude_effort: "high".into(),

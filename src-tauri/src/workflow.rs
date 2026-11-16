@@ -21,6 +21,7 @@ use crate::llm::{ChatMessage, LiveStats};
 use crate::pipeline::{self, CallReport, EditCall, ImplementRequest, ImplementResult, RunContext, lang_for};
 use crate::planner::{self, PlannerCall, PlannerEvent};
 use crate::project::{ProjectSource, unified_diff};
+use crate::sandbox::Sandbox;
 use crate::spec::parse_spec;
 use crate::staging::Staging;
 use crate::templates::{self, Template};
@@ -75,6 +76,9 @@ pub struct WorkflowReport {
     pub review: Option<Review>,
     /// One line for the result header.
     pub outcome: String,
+    /// The commands ran in the sandbox (Low integrity).
+    #[serde(default)]
+    pub sandboxed: bool,
 }
 
 /// What a run will do after the coder's first pass, decided from the settings and the spec.
@@ -138,6 +142,8 @@ pub struct Input<'a> {
     pub coder: &'a Profile,
     pub cancel: &'a CancellationToken,
     pub prewarmed: Option<u64>,
+    /// Run the verification commands in the sandbox (autopilot secure mode).
+    pub sandbox: bool,
 }
 
 /// Where planner output streams to: the expand step's `claude-event`s (with this job id), or a
@@ -375,6 +381,7 @@ struct Loop<'a> {
     report: WorkflowReport,
     last_results: Vec<CommandResult>,
     setup_done: bool,
+    sandbox: Option<Sandbox>,
 }
 
 impl<'a> Loop<'a> {
@@ -487,7 +494,11 @@ impl<'a> Loop<'a> {
             };
             self.phase(
                 StepKind::Verify,
-                &format!("{label}: running {} command(s) in the staging copy", cmds.len()),
+                &format!(
+                    "{label}: running {} command(s) in the staging copy{}",
+                    cmds.len(),
+                    if self.sandbox.is_some() { " (sandboxed)" } else { "" }
+                ),
             );
             let t = Instant::now();
             let results = verify::run_all(
@@ -497,6 +508,7 @@ impl<'a> Loop<'a> {
                 self.inp.cancel,
                 &self.core.sink,
                 self.inp.run_id,
+                self.sandbox.as_ref(),
             )
             .await;
             let ok = results.len() == cmds.len() && results.iter().all(|r| r.passed);
@@ -788,6 +800,18 @@ pub async fn run(core: &AppCore, inp: Input<'_>, plan: Plan) -> Result<Implement
             .await
             .map_err(|e| anyhow!("staging: {e}"))??
     };
+    // Label the mirror before anything runs in it; a sandbox that can't be set up stops the
+    // run rather than running the commands unsandboxed.
+    let sandbox = if inp.sandbox && !plan.commands.is_empty() {
+        let root = staging.root.clone();
+        let sb = tokio::task::spawn_blocking(move || Sandbox::prepare(&root))
+            .await
+            .map_err(|e| anyhow!("sandbox: {e}"))?
+            .map_err(|e| anyhow!("Could not set up the sandbox for the verification commands: {e:#}"))?;
+        Some(sb)
+    } else {
+        None
+    };
     let mut lp = Loop {
         core,
         inp: &inp,
@@ -797,6 +821,7 @@ pub async fn run(core: &AppCore, inp: Input<'_>, plan: Plan) -> Result<Implement
             coder: inp.coder.name.clone(),
             commands: plan.commands.clone(),
             commands_source: plan.commands_source.clone(),
+            sandboxed: sandbox.is_some(),
             ..Default::default()
         },
         settings,
@@ -806,13 +831,24 @@ pub async fn run(core: &AppCore, inp: Input<'_>, plan: Plan) -> Result<Implement
         calls: vec![],
         last_results: vec![],
         setup_done: false,
+        sandbox,
     };
     lp.step(WorkflowStep {
         kind: StepKind::Stage,
         label: "Staging copy".into(),
         ok: true,
         duration_ms: t.elapsed().as_millis() as u64,
-        detail: format!("{} files, {} copied, {} removed", st.files, st.copied, st.deleted),
+        detail: format!(
+            "{} files, {} copied, {} removed{}",
+            st.files,
+            st.copied,
+            st.deleted,
+            if lp.sandbox.is_some() {
+                " · sandboxed (Low integrity)"
+            } else {
+                ""
+            }
+        ),
         commands: vec![],
         review: None,
     });

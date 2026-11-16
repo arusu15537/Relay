@@ -1,7 +1,8 @@
 // UI scenario for the self-reliant loop against the fake llama-server: the local planner writes
 // the spec (with a tool call), the Spec pane shows the verification commands, the run builds in a
 // staging copy, fails, gets fixed, is reviewed (NEEDS_FIXES → follow-up → PASS), then accepted.
-// Finally autopilot: plan → implement → verify → review without stopping at the spec.
+// Finally autopilot: in secure mode it stops at the spec (the `findstr` check is not on the
+// allowlist); without secure mode it plans → implements → verifies → reviews without stopping.
 //
 // Relay must run with FAKE_LLM_SCRIPT pointing at the same file as this script uses
 // (default %TEMP%\relay-uitest\fake-script.json), so the fake server answers from these rules.
@@ -74,7 +75,7 @@ try {
   fs.writeFileSync(SCRIPT, JSON.stringify(RULES));
   resetProject();
   await c.ev(
-    "window.__relay.actions.saveSettings({ plannerBackend: 'local', plannerProfile: 'qwen3.6-35b-a3b', coderProfile: 'qwen3.6-35b-a3b', plannerTools: true, verifyEnabled: true, loopReview: true, followUpRounds: 1, maxFixRounds: 3, autopilot: false })",
+    "window.__relay.actions.saveSettings({ plannerBackend: 'local', plannerProfile: 'qwen3.6-35b-a3b', coderProfile: 'qwen3.6-35b-a3b', plannerTools: true, verifyEnabled: true, loopReview: true, followUpRounds: 1, maxFixRounds: 3, autopilot: false, autopilotSecure: true, sandboxAllRuns: false })",
   );
   await c.ev("window.__relay.useStore.setState({ implementProfile: 'qwen3.6-35b-a3b' })");
   await c.ev(`window.__relay.actions.openProject(${JSON.stringify(PROJECT)})`);
@@ -117,13 +118,29 @@ try {
   await c.click("Roles & loop");
   await new Promise((r) => setTimeout(r, 400));
   check(await c.ev("!!document.querySelector('select[aria-label=\"Planner model\"]') && !!document.querySelector('select[aria-label=\"Coder model\"]')"), "Settings → Roles & loop shows planner and coder");
+  check(await c.ev("document.body.innerText.includes('Allowlisted commands only, sandboxed')"), "Settings → Roles & loop has autopilot secure mode");
   await c.shot(`${OUT}/loop-4-settings.png`);
   await c.ev("window.__relay.useStore.setState({ settingsOpen: false })");
 
-  // Autopilot: plan → implement without stopping at the spec.
+  // Autopilot in secure mode: `findstr` is not an allowlisted build/test tool, so it stops at the spec.
   resetProject();
   await c.ev("window.__relay.actions.newJob()");
-  await c.ev("window.__relay.actions.saveSettings({ autopilot: true })");
+  await c.ev("window.__relay.actions.saveSettings({ autopilot: true, autopilotSecure: true })");
+  await c.ev("window.__relay.actions.refreshFiles()");
+  await c.type("textarea.instruction", "mark the app as fixed");
+  check(await c.ev("document.body.innerText.includes('Autopilot (secure)')"), "the autopilot checkbox says secure");
+  await c.click("Plan with");
+  await c.wait("window.__relay.useStore.getState().expandStatus !== 'running'", 60000, "planner finished (secure autopilot)");
+  await c.wait("/autopilot paused/.test(window.__relay.useStore.getState().expandInfo)", 10000, "secure autopilot paused");
+  check((await S("s.runs.length")) === 0, "secure autopilot started no run for a command outside the allowlist");
+  await c.wait("[...document.querySelectorAll('.note.warn')].some(n => n.textContent.includes('Secure mode won'))", 10000, "secure-mode note in the Spec pane");
+  check(await c.ev("!!document.querySelector('.chip.ctx.mono.warn')"), "the blocked command's chip is marked");
+  await c.shot(`${OUT}/loop-5-secure-paused.png`);
+
+  // Autopilot without secure mode: plan → implement without stopping at the spec.
+  resetProject();
+  await c.ev("window.__relay.actions.newJob()");
+  await c.ev("window.__relay.actions.saveSettings({ autopilot: true, autopilotSecure: false })");
   await c.ev("window.__relay.actions.refreshFiles()");
   await c.type("textarea.instruction", "mark the app as fixed");
   await c.click("Plan with");
@@ -131,12 +148,12 @@ try {
   await c.wait("window.__relay.useStore.getState().runs[0]?.status !== 'running'", 120000, "autopilot loop finished");
   const auto = await S("s.runs[0].response?.result.workflow?.outcome");
   check(/verified/.test(auto ?? ""), `autopilot ran the whole loop: "${auto}"`);
-  await c.shot(`${OUT}/loop-5-autopilot.png`);
+  await c.shot(`${OUT}/loop-6-autopilot.png`);
 } catch (e) {
   check(false, String(e));
   await c.shot(`${OUT}/loop-error.png`).catch(() => {});
 } finally {
-  await c.ev("window.__relay.actions.saveSettings({ autopilot: false })").catch(() => {});
+  await c.ev("window.__relay.actions.saveSettings({ autopilot: false, autopilotSecure: true })").catch(() => {});
   // Leave the app on the project the other scenarios expect.
   if (prevRoot && prevRoot !== PROJECT) await c.ev(`window.__relay.actions.openProject(${JSON.stringify(prevRoot)})`).catch(() => {});
   fs.writeFileSync(SCRIPT, "[]");

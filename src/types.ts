@@ -72,6 +72,10 @@ export interface Settings {
   buildTimeoutSecs: number;
   runTimeoutSecs: number;
   autopilot: boolean;
+  /** Autopilot secure mode: allowlisted commands only, run sandboxed. */
+  autopilotSecure: boolean;
+  /** Sandbox the verification of every run, also reviewed ones. */
+  sandboxAllRuns: boolean;
   claudeBackend: ClaudeBackend;
   claudeModel: string;
   claudeEffort: string;
@@ -165,6 +169,20 @@ export interface VerifyPreview {
   source: string;
   detectedFrom: string[];
   warnings: string[];
+  /** Commands autopilot secure mode would not run unattended. */
+  blocked: Blocked[];
+}
+
+export interface Blocked {
+  command: string;
+  reason: string;
+}
+
+export interface AutopilotCheck {
+  secure: boolean;
+  sandboxed: boolean;
+  commands: VerifyCommand[];
+  blocked: Blocked[];
 }
 
 export interface CommandResult {
@@ -200,6 +218,8 @@ export interface WorkflowReport {
   verified: boolean | null;
   review: Review | null;
   outcome: string;
+  /** The commands ran in the sandbox (Low integrity). */
+  sandboxed: boolean;
 }
 
 export interface CallBudget {
@@ -521,6 +541,7 @@ export interface RunEvent {
   summary?: string;
   detail?: string;
   timeoutSecs?: number;
+  sandboxed?: boolean;
 }
 
 export interface PrimeOutcome {

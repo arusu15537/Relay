@@ -136,6 +136,7 @@ export function InstructionPane() {
   const planner = useStore((s) => s.settings?.plannerBackend ?? "local");
   const plannerProfile = useStore((s) => s.settings?.plannerProfile ?? "");
   const autopilot = useStore((s) => s.settings?.autopilot ?? false);
+  const secure = useStore((s) => s.settings?.autopilotSecure ?? true);
   const profiles = useStore((s) => s.profiles);
   const cliPath = useStore((s) => s.boot?.cliPath);
   const hasKey = useStore((s) => s.boot?.hasApiKey);
@@ -211,8 +212,12 @@ export function InstructionPane() {
             ))}
           </select>
         )}
-        <label className="row faint" style={{ fontSize: 12, gap: 4 }} title="Implement, verify and review as soon as the spec is written, without the spec review">
-          <input type="checkbox" checked={autopilot} onChange={(e) => saveSettings({ autopilot: e.target.checked })} /> Autopilot
+        <label
+          className="row faint"
+          style={{ fontSize: 12, gap: 4 }}
+          title={`Implement, verify and review as soon as the spec is written, without the spec review.${secure ? " Secure mode: allowlisted commands only, run sandboxed (Settings → Roles)." : " Secure mode is off: the spec's commands run unreviewed with your permissions."}`}
+        >
+          <input type="checkbox" checked={autopilot} onChange={(e) => saveSettings({ autopilot: e.target.checked })} /> Autopilot{autopilot && secure ? " (secure)" : ""}
         </label>
         <span className="faint" style={{ fontSize: 12 }}>
           {local ? "" : backend === "cli" ? "Claude Code CLI · " : "Anthropic API · "}

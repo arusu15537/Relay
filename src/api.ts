@@ -40,7 +40,9 @@ export const api = {
     mode: T.SplitMode | null;
     profileId: string;
     fullContext: string[];
+    autopilot?: boolean;
   }) => invoke<T.ImplementResponse>("implement", { cmd }),
+  autopilotCheck: (root: string, spec: string) => invoke<T.AutopilotCheck>("autopilot_check", { root, spec }),
   cancelJob: (id: string) => invoke<boolean>("cancel_job", { id }),
   acceptFile: (runId: string, path: string, content: string | null, force: boolean) =>
     invoke<T.AcceptOutcome>("accept_file", { runId, path, content, force }),

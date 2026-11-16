@@ -10,8 +10,11 @@ mod imp {
         AttachConsole, CTRL_C_EVENT, FreeConsole, GenerateConsoleCtrlEvent, GetConsoleWindow, SetConsoleCtrlHandler,
     };
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_UILIMIT_DESKTOP,
+        JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS, JOB_OBJECT_UILIMIT_READCLIPBOARD,
+        JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess,
@@ -61,6 +64,30 @@ mod imp {
         }
         pub fn assign_pid(&self, pid: u32) -> bool {
             assign(self.0.0, pid)
+        }
+        /// Assign a process by handle (e.g. one created suspended, before it runs).
+        pub fn assign_handle(&self, process: std::os::windows::io::RawHandle) -> bool {
+            unsafe { AssignProcessToJobObject(self.0.0, process as HANDLE) != 0 }
+        }
+        /// Sandbox limits for the job's processes: no clipboard, no logoff/shutdown, no changes
+        /// to system parameters or display settings, no switching or creating desktops.
+        pub fn restrict_ui(&self) -> bool {
+            let info = JOBOBJECT_BASIC_UI_RESTRICTIONS {
+                UIRestrictionsClass: JOB_OBJECT_UILIMIT_READCLIPBOARD
+                    | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
+                    | JOB_OBJECT_UILIMIT_EXITWINDOWS
+                    | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
+                    | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
+                    | JOB_OBJECT_UILIMIT_DESKTOP,
+            };
+            unsafe {
+                SetInformationJobObject(
+                    self.0.0,
+                    JobObjectBasicUIRestrictions,
+                    &info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+                ) != 0
+            }
         }
         pub fn terminate(&self) {
             unsafe {

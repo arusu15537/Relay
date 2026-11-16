@@ -363,6 +363,7 @@ fn cmd(root: &str, spec: &str, ctx: &[String], mode: SplitMode, profile: &str, r
         mode: Some(mode),
         profile_id: profile.into(),
         full_context: ctx.to_vec(),
+        autopilot: false,
     }
 }
 

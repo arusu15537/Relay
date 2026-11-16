@@ -80,8 +80,8 @@ function onRunEvent(ev: T.RunEvent) {
     case "cmdStart":
       updateRun(ev.runId, () => ({
         phase: "verify",
-        cmdStream: `> ${ev.command}\n`,
-        callLabel: `Running ${ev.step}: ${ev.command} (timeout ${ev.timeoutSecs ?? "?"}s)`,
+        cmdStream: `> ${ev.command}${ev.sandboxed ? "   [sandboxed]" : ""}\n`,
+        callLabel: `Running ${ev.step}: ${ev.command} (timeout ${ev.timeoutSecs ?? "?"}s${ev.sandboxed ? ", sandboxed" : ""})`,
       }));
       break;
     case "cmdOutput":
@@ -328,10 +328,18 @@ export async function expand() {
     });
     for (const w of res.warnings) toast(w);
     schedulePrepare(0);
-    // Autopilot: no spec review — implement right away if the spec names files.
+    // Autopilot: no spec review — implement right away if the spec names files. In secure mode
+    // only when every verification command is allowed; otherwise stop here for the review.
     if (get().settings?.autopilot && res.parsed.files.length > 0 && !res.parsed.warnings.some((w) => w.includes("no `## Files`"))) {
-      toast("Autopilot: implementing the spec without review", "info");
-      await implement();
+      const check = await api.autopilotCheck(s.root, res.spec);
+      if (check.blocked.length > 0) {
+        const list = check.blocked.map((b) => `\`${b.command}\` (${b.reason})`).join("; ");
+        set({ expandInfo: `${get().expandInfo} · autopilot paused for your review` });
+        toast(`Autopilot paused — secure mode won't run ${list} unattended. Review the spec, then press Implement.`, "error");
+        return;
+      }
+      toast(check.sandboxed ? "Autopilot: implementing without review, commands sandboxed" : "Autopilot: implementing the spec without review", "info");
+      await implement(undefined, undefined, true);
     }
   } catch (e) {
     set({ expandStatus: "error", specStatus: "idle", expandError: errText(e), expandInfo: "" });
@@ -433,7 +441,7 @@ function newRun(runId: string, profileId: string, spec: string): RunView {
   };
 }
 
-export async function implement(profileId?: string, specOverride?: string) {
+export async function implement(profileId?: string, specOverride?: string, autopilot = false) {
   const s = get();
   const pid = profileId ?? s.implementProfile;
   const spec = specOverride ?? s.spec;
@@ -458,6 +466,7 @@ export async function implement(profileId?: string, specOverride?: string) {
       mode: s.mode === "auto" ? null : s.mode,
       profileId: pid,
       fullContext: s.fullContext,
+      autopilot,
     });
     const r = resp.result;
     const decisions: Record<string, "pending"> = {};
