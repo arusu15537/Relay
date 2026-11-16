@@ -247,6 +247,7 @@ cargo test --lib                     :: unit tests
 cargo run --example e2e -- fake      :: backend end-to-end against a fake llama-server (no GPU), incl. the planner/coder loop and secure autopilot
 cargo run --example e2e -- claude    :: + real Claude CLI expansion and review
 cargo run --example e2e -- real      :: real llama-server + the three real models (uses the GPU!)
+cargo run --example e2e -- loop-real :: the loop on the real models: local planner on all three, Qwen3.6 secure autopilot loop, a forced cargo fix round (GPU!); specs + reports in %TEMP%elay-e2eeal-loop
 cargo run --release --example bench  :: launch-argument variants of the three profiles, ≈30 min (GPU!); report in %TEMP%\relay-bench
 ```
 

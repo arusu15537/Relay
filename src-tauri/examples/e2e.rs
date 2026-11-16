@@ -202,6 +202,233 @@ fn set_script(path: &Path, rules: serde_json::Value) {
     std::fs::write(path, rules.to_string()).unwrap();
 }
 
+/// `loop-real` (GPU): the self-reliant loop on the real models. The local planner writes a spec
+/// on each of the three models (tool calls and thinking through each chat template); Qwen3.6
+/// then runs the whole loop on its spec under secure autopilot (sandboxed cargo build/test,
+/// fix rounds, review); finally a project with a type error the spec doesn't mention forces a
+/// real `cargo build` fix round. Specs and reports go to `%TEMP%\relay-e2e\real-loop\`.
+async fn real_loop(core: &AppCore, base: &Path, c: &mut Checks) {
+    let dir = base.join("real-loop-project");
+    let out = base.join("real-loop");
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).unwrap();
+    let make = |broken: bool| {
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"textkit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        let count = if broken {
+            "/// Number of characters (not bytes) in `s`.\npub fn char_count(s: &str) -> u32 {\n    s.chars().count()\n}\n"
+        } else {
+            "/// Number of characters (not bytes) in `s`.\npub fn char_count(s: &str) -> u32 {\n    s.chars().count() as u32\n}\n"
+        };
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            format!(
+                "//! Small text utilities.\n\n/// Collapse runs of whitespace into single spaces and trim both ends.\npub fn normalize_spaces(s: &str) -> String {{\n    s.split_whitespace().collect::<Vec<_>>().join(\" \")\n}}\n\n{count}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tests/basic.rs"),
+            "use textkit::*;\n\n#[test]\nfn normalizes() {\n    assert_eq!(normalize_spaces(\"  a \\t b\\n\"), \"a b\");\n}\n\n#[test]\nfn counts_chars() {\n    assert_eq!(char_count(\"héllo\"), 5);\n}\n",
+        )
+        .unwrap();
+    };
+    let root = dir.to_string_lossy().into_owned();
+    let instruction = "Add a `parse_duration` function to the library that turns strings like \"1h30m\", \"45s\" or \"2h5m10s\" into a number of seconds, and rejects empty or malformed input with an error. Cover it with tests.";
+    let mut s = core.settings();
+    s.planner_backend = relay_lib::config::PlannerBackend::Local;
+    s.planner_tools = true;
+    s.coder_profile = "qwen3.6-35b-a3b".into();
+    s.verify_enabled = true;
+    s.loop_review = true;
+    s.follow_up_rounds = 1;
+    s.max_fix_rounds = 3;
+    s.autopilot = true;
+    s.autopilot_secure = true;
+    s.sandbox_all_runs = false;
+    core.set_settings(s).unwrap();
+    let step_lines = |w: &relay_lib::workflow::WorkflowReport| -> Vec<String> {
+        w.steps
+            .iter()
+            .map(|s| format!("{:?} {} ok={} — {}", s.kind, s.label, s.ok, s.detail))
+            .collect()
+    };
+
+    println!("\n== loop-real 1: the local planner on each model (thinking + read-only tools)");
+    let mut qwen36_spec = None;
+    for planner in ["qwen3.8-27b", "gpt-oss-20b", "qwen3.6-35b-a3b"] {
+        make(false);
+        let mut s = core.settings();
+        s.planner_profile = planner.into();
+        core.set_settings(s).unwrap();
+        let t = Instant::now();
+        match core
+            .expand(ExpandRequest {
+                job_id: format!("job-real-plan-{planner}"),
+                instruction: instruction.into(),
+                project_root: root.clone(),
+                context_files: vec![],
+                profile_id: "qwen3.6-35b-a3b".into(),
+            })
+            .await
+        {
+            Ok(ex) => {
+                std::fs::write(out.join(format!("spec-{planner}.md")), &ex.spec).unwrap();
+                let p = &ex.parsed;
+                let fences = ex.spec.matches("```").count();
+                println!(
+                    "     {planner}: {:.0}s, {:.0} tok/s, tools {:?}, files {:?}, verification {:?}, warnings {:?}, {} fence(s)",
+                    t.elapsed().as_secs_f64(),
+                    ex.claude.tok_per_sec.unwrap_or(0.0),
+                    ex.claude.tool_calls,
+                    p.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+                    p.verification.iter().map(|v| v.command.clone()).collect::<Vec<_>>(),
+                    ex.warnings,
+                    fences / 2
+                );
+                c.check(
+                    ex.claude.backend == "local" && !ex.claude.cancelled && !p.files.is_empty(),
+                    format!(
+                        "{planner} wrote a spec that names {} file(s) in {:.0}s",
+                        p.files.len(),
+                        t.elapsed().as_secs_f64()
+                    ),
+                );
+                // The whole project fits the planner's source overview, so a tool call is the
+                // model's choice, not a requirement.
+                println!("  INFO  {planner} tool calls: {:?}", ex.claude.tool_calls);
+                c.check(
+                    fences == 0,
+                    format!("{planner}'s spec has no code blocks (design only; {} fence(s))", fences / 2),
+                );
+                if planner == "qwen3.6-35b-a3b" {
+                    qwen36_spec = Some(ex.spec.clone());
+                }
+            }
+            Err(e) => c.check(false, format!("{planner} as planner failed: {e:#}")),
+        }
+    }
+
+    println!("\n== loop-real 2: Qwen3.6 plans and codes, secure autopilot (sandboxed build/test, fixes, review)");
+    if let Some(spec) = qwen36_spec {
+        make(false);
+        let chk = core.autopilot_check(&root, &spec);
+        println!(
+            "     commands {:?}, blocked {:?}",
+            chk.commands.iter().map(|v| v.command.clone()).collect::<Vec<_>>(),
+            chk.blocked
+        );
+        c.check(
+            chk.blocked.is_empty() && chk.sandboxed,
+            format!(
+                "secure mode lets the planner's commands run unattended ({} blocked)",
+                chk.blocked.len()
+            ),
+        );
+        let t = Instant::now();
+        let cmd = ImplementCommand {
+            job_id: "job-real-plan-qwen3.6-35b-a3b".into(),
+            run_id: Some("run-real-loop".into()),
+            project_root: root.clone(),
+            instruction: instruction.into(),
+            spec: spec.clone(),
+            context_files: vec![],
+            full_context: vec![],
+            mode: None,
+            profile_id: "qwen3.6-35b-a3b".into(),
+            autopilot: chk.blocked.is_empty(),
+        };
+        match core.implement(cmd).await {
+            Ok(resp) => {
+                let r = &resp.result;
+                let w = r.workflow.clone().unwrap_or_default();
+                let lines = step_lines(&w);
+                for l in &lines {
+                    println!("     {l}");
+                }
+                std::fs::write(out.join("loop-report.json"), serde_json::to_string_pretty(&resp).unwrap()).unwrap();
+                let fixes = w.steps.iter().filter(|s| s.kind == relay_lib::workflow::StepKind::Fix).count();
+                println!(
+                    "     outcome: {} in {:.0}s, coder {:.0} tok/s avg, {fixes} fix round(s), review: {:?}",
+                    w.outcome,
+                    t.elapsed().as_secs_f64(),
+                    r.avg_tok_per_sec.unwrap_or(0.0),
+                    w.review.as_ref().map(|rv| rv.passed)
+                );
+                c.check(
+                    w.sandboxed && !w.steps.is_empty() && r.error.is_none(),
+                    format!("the loop ran to the end, sandboxed: {}", w.outcome),
+                );
+                c.check(
+                    w.verified == Some(true),
+                    format!("the change builds and its tests pass ({fixes} fix round(s))"),
+                );
+                c.check(
+                    w.review.as_ref().is_some_and(|rv| rv.passed),
+                    format!(
+                        "the planner's final review passes: {:?}",
+                        w.review.as_ref().map(|rv| rv.verdict.clone())
+                    ),
+                );
+            }
+            Err(e) => c.check(false, format!("loop failed: {e:#}")),
+        }
+    }
+
+    println!("\n== loop-real 3: a type error the spec doesn't mention forces a real cargo fix round");
+    make(true);
+    let spec = "## Summary\nAdd `word_count` to the library.\n\n## Design\n- `pub fn word_count(s: &str) -> usize` in `src/lib.rs`: the number of whitespace-separated words, consistent with how `normalize_spaces` splits.\n\n## Files\n- `src/lib.rs` (modify) — add `word_count`\n\n## Changes\n### `src/lib.rs`\nAdd `word_count` after `normalize_spaces`, with a doc comment. Leave the other functions as they are.\n\n## Edge cases\n- An empty or all-whitespace string has 0 words.\n\n## Acceptance criteria\n- `word_count(\"a  b\\tc\")` is 3.\n\n## Verification\n- build: `cargo build`\n- test: `cargo test -q`\n";
+    let mut s = core.settings();
+    s.loop_review = false;
+    core.set_settings(s).unwrap();
+    let t = Instant::now();
+    let cmd = ImplementCommand {
+        job_id: "job-real-fix".into(),
+        run_id: Some("run-real-fix".into()),
+        project_root: root.clone(),
+        instruction: "add word_count".into(),
+        spec: spec.into(),
+        context_files: vec![],
+        full_context: vec![],
+        mode: None,
+        profile_id: "qwen3.6-35b-a3b".into(),
+        autopilot: true,
+    };
+    match core.implement(cmd).await {
+        Ok(resp) => {
+            let w = resp.result.workflow.clone().unwrap_or_default();
+            for l in step_lines(&w) {
+                println!("     {l}");
+            }
+            std::fs::write(out.join("fix-report.json"), serde_json::to_string_pretty(&resp).unwrap()).unwrap();
+            let first = w.steps.iter().find(|s| s.kind == relay_lib::workflow::StepKind::Verify);
+            let fixes = w.steps.iter().filter(|s| s.kind == relay_lib::workflow::StepKind::Fix).count();
+            c.check(
+                first.is_some_and(|s| !s.ok && s.detail.contains("cargo build")),
+                format!(
+                    "the first sandboxed build fails on the type error: {:?}",
+                    first.map(|s| s.detail.clone())
+                ),
+            );
+            c.check(
+                fixes >= 1 && w.verified == Some(true),
+                format!(
+                    "the coder fixed it from the compiler output ({fixes} fix round(s), {:.0}s): {}",
+                    t.elapsed().as_secs_f64(),
+                    w.outcome
+                ),
+            );
+        }
+        Err(e) => c.check(false, format!("fix-round run failed: {e:#}")),
+    }
+}
+
 /// Slice g, secure autopilot: a spec whose commands are not allowlisted is refused before any
 /// model work; an allowed one runs `cargo build` / `cargo test` sandboxed, and a test of the
 /// project that tries to write into the real project folder finds it can't.
@@ -362,7 +589,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
     // ---- configure ----------------------------------------------------------------------------
     let mut settings = core.settings();
     let mut profiles = core.profiles();
-    if mode == "real" {
+    if mode == "real" || mode == "loop-real" {
         settings.llama_server_path =
             std::env::var("RELAY_LLAMA_SERVER").unwrap_or_else(|_| r"D:\LocalAI-models\llama.cpp-b12360\bin\llama-server.exe".into());
         settings.models_dir = std::env::var("RELAY_MODELS_DIR").unwrap_or_else(|_| r"D:\LocalAI-models".into());
@@ -392,6 +619,16 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
     settings.planner_backend = relay_lib::config::PlannerBackend::Claude;
     core.set_settings(settings.clone()).unwrap();
     core.set_profiles(profiles.clone()).unwrap();
+
+    if mode == "loop-real" {
+        real_loop(&core, base, &mut c).await;
+        core.shutdown().await;
+        println!("\n{} passed, {} failed", c.passed.len(), c.failed.len());
+        for f in &c.failed {
+            println!("  FAILED: {f}");
+        }
+        return if c.failed.is_empty() { 0 } else { 1 };
+    }
 
     // ---- slice a: managed server + hard-coded spec + apply --------------------------------------
     println!("\n== Slice a: managed llama-server for Qwen3.8-27B, hard-coded spec, apply");
