@@ -281,9 +281,12 @@ async fn real_loop(core: &AppCore, base: &Path, c: &mut Checks) {
             Ok(ex) => {
                 std::fs::write(out.join(format!("spec-{planner}.md")), &ex.spec).unwrap();
                 let p = &ex.parsed;
-                let fences = ex.spec.matches("```").count();
+                // expand.md allows one Mermaid classDiagram; any other fenced block is code.
+                let openers: Vec<&str> = ex.spec.lines().map(str::trim).filter(|l| l.starts_with("```")).step_by(2).collect();
+                let mermaid = openers.iter().filter(|l| l.trim_start_matches('`').trim() == "mermaid").count();
+                let fences = (openers.len() - mermaid.min(1)) * 2;
                 println!(
-                    "     {planner}: {:.0}s, {:.0} tok/s, tools {:?}, files {:?}, verification {:?}, warnings {:?}, {} fence(s)",
+                    "     {planner}: {:.0}s, {:.0} tok/s, tools {:?}, files {:?}, verification {:?}, warnings {:?}, {mermaid} mermaid diagram(s), {} other fence(s)",
                     t.elapsed().as_secs_f64(),
                     ex.claude.tok_per_sec.unwrap_or(0.0),
                     ex.claude.tool_calls,
@@ -305,7 +308,10 @@ async fn real_loop(core: &AppCore, base: &Path, c: &mut Checks) {
                 println!("  INFO  {planner} tool calls: {:?}", ex.claude.tool_calls);
                 c.check(
                     fences == 0,
-                    format!("{planner}'s spec has no code blocks (design only; {} fence(s))", fences / 2),
+                    format!(
+                        "{planner}'s spec has no code blocks besides one Mermaid class diagram ({} other block(s))",
+                        fences / 2
+                    ),
                 );
                 if planner == "qwen3.6-35b-a3b" {
                     qwen36_spec = Some(ex.spec.clone());
