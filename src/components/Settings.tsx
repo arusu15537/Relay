@@ -255,6 +255,19 @@ function Roles() {
           <input type="checkbox" checked={s.autopilot} onChange={(e) => saveSettings({ autopilot: e.target.checked })} /> Skip the spec review
         </label>
       </Field>
+      <Field
+        label="Secure mode"
+        hint="For autopilot runs. Only known build and test commands run unattended (cargo, npm, python -m pytest, go, dotnet, a program in the project…, no shell operators); any other command stops autopilot at the spec for your review. The commands run sandboxed at Low integrity: they can't change or delete anything outside the staging copy, reach your other windows, the clipboard or system settings. They can still read files and use the network. Tool caches (cargo, npm, pip, Go, NuGet, TEMP) live in Relay's sandbox folder."
+      >
+        <div className="col" style={{ gap: 4 }}>
+          <label className="row">
+            <input type="checkbox" checked={s.autopilotSecure} onChange={(e) => saveSettings({ autopilotSecure: e.target.checked })} /> Allowlisted commands only, sandboxed
+          </label>
+          <label className="row">
+            <input type="checkbox" checked={s.sandboxAllRuns} onChange={(e) => saveSettings({ sandboxAllRuns: e.target.checked })} /> Sandbox reviewed runs too
+          </label>
+        </div>
+      </Field>
     </div>
   );
 }

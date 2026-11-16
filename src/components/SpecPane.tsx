@@ -43,6 +43,10 @@ function relToRoot(text: string, root: string): string {
 }
 
 function Verification({ v }: { v: VerifyPreview }) {
+  const autopilot = useStore((s) => s.settings?.autopilot ?? false);
+  const secure = useStore((s) => s.settings?.autopilotSecure ?? true);
+  const sandboxAll = useStore((s) => s.settings?.sandboxAllRuns ?? false);
+  const blocked = new Map((v.blocked ?? []).map((b) => [b.command, b.reason]));
   const source = v.source === "spec" ? "from the spec's Verification section" : v.source === "detected" ? `detected from ${v.detectedFrom.join(", ") || "the project"}` : "";
   return (
     <div className="col">
@@ -59,14 +63,24 @@ function Verification({ v }: { v: VerifyPreview }) {
         <>
           <div className="chips">
             {v.commands.map((c, i) => (
-              <span key={i} className="chip ctx mono" title={`${c.kind}${c.timeoutSecs ? ` · timeout ${c.timeoutSecs}s` : ""}${c.expect ? ` · output must contain "${c.expect}"` : ""}`}>
+              <span
+                key={i}
+                className={`chip ctx mono${autopilot && secure && blocked.has(c.command) ? " warn" : ""}`}
+                title={`${c.kind}${c.timeoutSecs ? ` · timeout ${c.timeoutSecs}s` : ""}${c.expect ? ` · output must contain "${c.expect}"` : ""}${blocked.has(c.command) ? ` · secure mode: ${blocked.get(c.command)}` : ""}`}
+              >
                 <b>{c.kind}</b> {c.command}
               </span>
             ))}
           </div>
           <span className="faint" style={{ fontSize: 12 }}>
-            Run in a staging copy of the project, {source}. Failures go back to the coder.
+            Run in a staging copy of the project, {source}
+            {sandboxAll ? ", sandboxed" : ""}. Failures go back to the coder.
           </span>
+          {autopilot && secure && blocked.size > 0 && (
+            <div className="note warn">
+              Secure mode won't run {[...blocked.keys()].map((c) => `\`${c}\``).join(", ")} unattended, so autopilot stops at this spec. Implement runs it after your review.
+            </div>
+          )}
         </>
       )}
       {v.warnings.map((w, i) => (

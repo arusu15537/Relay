@@ -117,6 +117,21 @@ pub struct ImplementCommand {
     /// Context files to send in full even when outlines are on (Settings → context outlines).
     #[serde(default)]
     pub full_context: Vec<String>,
+    /// Started by autopilot (the spec was not reviewed): secure mode applies.
+    #[serde(default)]
+    pub autopilot: bool,
+}
+
+/// Whether autopilot may implement a spec without the review, and how it would run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutopilotCheck {
+    pub secure: bool,
+    /// The verification commands would run sandboxed.
+    pub sandboxed: bool,
+    pub commands: Vec<crate::verify::VerifyCommand>,
+    /// Commands secure mode does not run unattended (empty: autopilot may go on).
+    pub blocked: Vec<crate::sandbox::Blocked>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -726,6 +741,19 @@ impl AppCore {
         }
     }
 
+    /// What autopilot would do with `spec`: secure mode's verdict on its verification commands.
+    pub fn autopilot_check(&self, project_root: &str, spec: &str) -> AutopilotCheck {
+        let settings = self.settings();
+        let plan = crate::workflow::plan(self, &settings, spec, Path::new(project_root));
+        let secure = settings.autopilot_secure;
+        AutopilotCheck {
+            secure,
+            sandboxed: !plan.commands.is_empty() && (secure || settings.sandbox_all_runs),
+            blocked: if secure { crate::sandbox::blocked(&plan.commands) } else { vec![] },
+            commands: plan.commands,
+        }
+    }
+
     pub async fn implement(&self, cmd: ImplementCommand) -> Result<ImplementResponse> {
         if let Some(t) = self.prewarm_cancel.lock().unwrap().take() {
             t.cancel();
@@ -738,6 +766,15 @@ impl AppCore {
         if !Path::new(&cmd.project_root).is_dir() {
             bail!("Project folder does not exist: {}", cmd.project_root);
         }
+        let plan = crate::workflow::plan(self, &settings, &cmd.spec, Path::new(&cmd.project_root));
+        let secure = cmd.autopilot && settings.autopilot_secure;
+        if secure {
+            let blocked = crate::sandbox::blocked(&plan.commands);
+            if !blocked.is_empty() {
+                bail!("{}", crate::sandbox::blocked_message(&blocked));
+            }
+        }
+        let sandbox = secure || settings.sandbox_all_runs;
         let run_id = cmd.run_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.history.ensure_job(&cmd.job_id, &cmd.project_root, &cmd.instruction)?;
         self.history.update_job_spec(&cmd.job_id, &cmd.spec, &cmd.context_files)?;
@@ -753,7 +790,6 @@ impl AppCore {
                 return Err(e);
             }
         };
-        let plan = crate::workflow::plan(self, &settings, &cmd.spec, Path::new(&cmd.project_root));
         if !plan.is_plain() {
             let input = crate::workflow::Input {
                 run_id: &run_id,
@@ -765,6 +801,7 @@ impl AppCore {
                 coder: &profile,
                 cancel: &cancel,
                 prewarmed,
+                sandbox,
             };
             let result = crate::workflow::run(self, input, plan).await;
             self.finish_job(&run_id);

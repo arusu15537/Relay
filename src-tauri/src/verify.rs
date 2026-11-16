@@ -3,6 +3,7 @@
 //! a hidden console. Their output is condensed for the coder's fix round.
 
 use crate::events::{Sink, emit};
+use crate::sandbox::{Blocked, Sandbox};
 use crate::winproc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -308,6 +309,9 @@ pub struct VerifyPreview {
     pub source: String,
     pub detected_from: Vec<String>,
     pub warnings: Vec<String>,
+    /// Commands autopilot secure mode would not run unattended.
+    #[serde(default)]
+    pub blocked: Vec<Blocked>,
 }
 
 pub fn preview(enabled: bool, spec: &crate::spec::ParsedSpec, root: &Path) -> VerifyPreview {
@@ -321,6 +325,7 @@ pub fn preview(enabled: bool, spec: &crate::spec::ParsedSpec, root: &Path) -> Ve
     let (commands, source) = commands_for(spec, &detected);
     VerifyPreview {
         enabled,
+        blocked: crate::sandbox::blocked(&commands),
         commands,
         source: source.into(),
         detected_from: detected.sources,
@@ -445,8 +450,22 @@ fn floor_char(s: &str, mut i: usize) -> usize {
 }
 
 type Pipe = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+type OutTx = tokio::sync::mpsc::UnboundedSender<String>;
 
-fn read_pipe(pipe: Pipe, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+/// The decodable start of `pending` as text (removed from it). An incomplete UTF-8 sequence at
+/// the end stays for the next read; invalid bytes (OEM code page output) are decoded lossily.
+fn take_text(pending: &mut Vec<u8>) -> String {
+    let valid = match std::str::from_utf8(pending) {
+        Ok(_) => pending.len(),
+        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+        Err(_) => pending.len(),
+    };
+    let text = String::from_utf8_lossy(&pending[..valid]).into_owned();
+    pending.drain(..valid);
+    text
+}
+
+fn read_pipe(pipe: Pipe, tx: OutTx) {
     tokio::spawn(async move {
         let mut pipe = pipe;
         let mut buf = vec![0u8; 8192];
@@ -456,16 +475,7 @@ fn read_pipe(pipe: Pipe, tx: tokio::sync::mpsc::UnboundedSender<String>) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     pending.extend_from_slice(&buf[..n]);
-                    let valid = match std::str::from_utf8(&pending) {
-                        Ok(_) => pending.len(),
-                        // An incomplete sequence at the end: wait for the rest.
-                        Err(e) if e.error_len().is_none() => e.valid_up_to(),
-                        // Invalid bytes (OEM code page output): decode lossily.
-                        Err(_) => pending.len(),
-                    };
-                    let text = String::from_utf8_lossy(&pending[..valid]).into_owned();
-                    pending.drain(..valid);
-                    if tx.send(text).is_err() {
+                    if tx.send(take_text(&mut pending)).is_err() {
                         break;
                     }
                 }
@@ -477,14 +487,87 @@ fn read_pipe(pipe: Pipe, tx: tokio::sync::mpsc::UnboundedSender<String>) {
     });
 }
 
+/// `read_pipe` for a synchronous pipe (the sandbox's), on its own thread.
+fn read_pipe_blocking(mut pipe: impl std::io::Read + Send + 'static, tx: OutTx) {
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 8192];
+        let mut pending = Vec::new();
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    pending.extend_from_slice(&buf[..n]);
+                    if tx.send(take_text(&mut pending)).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        if !pending.is_empty() {
+            let _ = tx.send(String::from_utf8_lossy(&pending).into_owned());
+        }
+    });
+}
+
+/// Variables every verification command gets: no colours, CI behaviour, unbuffered output.
+const VERIFY_ENV: &[(&str, &str)] = &[
+    ("NO_COLOR", "1"),
+    ("CARGO_TERM_COLOR", "never"),
+    ("FORCE_COLOR", "0"),
+    ("CI", "1"),
+    ("PYTHONUNBUFFERED", "1"),
+    ("RUST_BACKTRACE", "1"),
+    ("DOTNET_CLI_TELEMETRY_OPTOUT", "1"),
+];
+
+/// A started command: its exit code once it ends, and its process id.
+type Started = (tokio::task::JoinHandle<Option<i32>>, u32);
+
+fn spawn_plain(command: &str, cwd: &Path, job: Option<&winproc::TreeJob>, tx: OutTx) -> std::io::Result<Started> {
+    let mut c = shell_command(command);
+    c.current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    for (k, v) in VERIFY_ENV {
+        c.env(k, v);
+    }
+    winproc::hide_window(&mut c);
+    let mut child = c.spawn()?;
+    let pid = child.id().unwrap_or(0);
+    if let Some(j) = job {
+        j.assign_pid(pid);
+    }
+    if let Some(p) = child.stdout.take() {
+        read_pipe(Box::new(p), tx.clone());
+    }
+    if let Some(p) = child.stderr.take() {
+        read_pipe(Box::new(p), tx);
+    }
+    let exit = tokio::spawn(async move { child.wait().await.ok().and_then(|s| s.code()) });
+    Ok((exit, pid))
+}
+
+fn spawn_sandboxed(command: &str, cwd: &Path, sandbox: &Sandbox, job: Option<&winproc::TreeJob>, tx: OutTx) -> std::io::Result<Started> {
+    let job = job.ok_or_else(|| std::io::Error::other("could not create the job object the sandbox runs in"))?;
+    let env = sandbox.environment(VERIFY_ENV);
+    let crate::sandbox::LowChild { process, pid, output } = crate::sandbox::spawn_low(command, cwd, &env, job)?;
+    read_pipe_blocking(output, tx);
+    let exit = tokio::task::spawn_blocking(move || crate::sandbox::wait_low(&process));
+    Ok((exit, pid))
+}
+
 /// Run one command with `cmd /C` in `cwd`: hidden console, no stdin, its whole process tree in a
 /// job that is terminated on timeout or cancel. `on_output` receives the output as it arrives.
+/// With `sandbox`, the command runs at Low integrity (see `sandbox`).
 pub async fn run_command(
     cmd: &VerifyCommand,
     cwd: &Path,
     timeout: Duration,
     cancel: &CancellationToken,
     on_output: &mut (dyn FnMut(&str) + Send),
+    sandbox: Option<&Sandbox>,
 ) -> CommandResult {
     let started = Instant::now();
     let mut res = CommandResult {
@@ -492,40 +575,20 @@ pub async fn run_command(
         command: cmd.command.clone(),
         ..Default::default()
     };
-    let mut c = shell_command(&cmd.command);
-    c.current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .env("NO_COLOR", "1")
-        .env("CARGO_TERM_COLOR", "never")
-        .env("FORCE_COLOR", "0")
-        .env("CI", "1")
-        .env("PYTHONUNBUFFERED", "1")
-        .env("RUST_BACKTRACE", "1")
-        .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
-        .kill_on_drop(true);
-    winproc::hide_window(&mut c);
-    let mut child = match c.spawn() {
-        Ok(ch) => ch,
+    let job = winproc::TreeJob::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let spawned = match sandbox {
+        Some(sb) => spawn_sandboxed(&cmd.command, cwd, sb, job.as_ref(), tx),
+        None => spawn_plain(&cmd.command, cwd, job.as_ref(), tx),
+    };
+    let (mut exit, pid) = match spawned {
+        Ok(s) => s,
         Err(e) => {
             res.spawn_error = Some(e.to_string());
             res.duration_ms = started.elapsed().as_millis() as u64;
             return res;
         }
     };
-    let job = winproc::TreeJob::new();
-    if let (Some(j), Some(pid)) = (&job, child.id()) {
-        j.assign_pid(pid);
-    }
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    if let Some(p) = child.stdout.take() {
-        read_pipe(Box::new(p), tx.clone());
-    }
-    if let Some(p) = child.stderr.take() {
-        read_pipe(Box::new(p), tx.clone());
-    }
-    drop(tx);
     let mut out = OutBuf::default();
     let take = |t: String, out: &mut OutBuf, on_output: &mut (dyn FnMut(&str) + Send)| {
         let t = strip_ansi(&t.replace("\r\n", "\n"));
@@ -542,7 +605,7 @@ pub async fn run_command(
                 Some(t) => take(t, &mut out, on_output),
                 None => pipes_open = false,
             },
-            s = child.wait(), if status.is_none() => status = Some(s),
+            s = &mut exit, if status.is_none() => status = Some(s.ok().flatten()),
             _ = &mut deadline => {
                 // A child that exited but left a grandchild holding the pipes is done.
                 res.timed_out = status.is_none();
@@ -554,12 +617,14 @@ pub async fn run_command(
             }
         }
     }
-    if let Some(j) = &job {
-        j.terminate();
+    match &job {
+        Some(j) => j.terminate(),
+        None => {
+            winproc::kill_pid(pid);
+        }
     }
-    let _ = child.start_kill();
     if status.is_none() {
-        status = Some(child.wait().await);
+        status = Some(exit.await.ok().flatten());
     }
     while let Ok(t) = rx.try_recv() {
         take(t, &mut out, on_output);
@@ -567,7 +632,7 @@ pub async fn run_command(
     res.duration_ms = started.elapsed().as_millis() as u64;
     res.output = out.text();
     if !res.timed_out && !res.cancelled {
-        res.exit_code = status.and_then(|s| s.ok()).and_then(|s| s.code());
+        res.exit_code = status.flatten();
     }
     let exit_ok = res.exit_code == Some(0);
     res.passed = !res.cancelled
@@ -608,6 +673,7 @@ pub async fn run_all(
     cancel: &CancellationToken,
     sink: &Sink,
     run_id: &str,
+    sandbox: Option<&Sandbox>,
 ) -> Vec<CommandResult> {
     let mut results = Vec::new();
     for cmd in cmds {
@@ -621,7 +687,7 @@ pub async fn run_all(
         emit(
             sink,
             "run-event",
-            &json!({ "runId": run_id, "kind": "cmdStart", "step": cmd.kind, "command": cmd.command, "timeoutSecs": timeout.as_secs() }),
+            &json!({ "runId": run_id, "kind": "cmdStart", "step": cmd.kind, "command": cmd.command, "timeoutSecs": timeout.as_secs(), "sandboxed": sandbox.is_some() }),
         );
         let mut buf = String::new();
         let mut last = Instant::now();
@@ -638,7 +704,7 @@ pub async fn run_all(
                 last = Instant::now();
             }
         };
-        let r = run_command(cmd, cwd, timeout, cancel, &mut on).await;
+        let r = run_command(cmd, cwd, timeout, cancel, &mut on, sandbox).await;
         on("");
         emit(
             sink,
@@ -860,21 +926,38 @@ mod tests {
         assert_eq!(commands_for(&absent, &detected), (detected.commands.clone(), "detected"));
     }
 
-    fn run(cmd: VerifyCommand, secs: u64) -> CommandResult {
+    /// A working folder, sandboxed (Low integrity) or not.
+    fn workdir(sandboxed: bool) -> (tempfile::TempDir, std::path::PathBuf, Option<Sandbox>) {
         let d = tempfile::tempdir().unwrap();
+        let work = d.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let sb = sandboxed.then(|| Sandbox::prepare_in(&d.path().join("home"), &work).unwrap());
+        (d, work, sb)
+    }
+
+    fn run_in(cmd: VerifyCommand, secs: u64, sandboxed: bool) -> CommandResult {
+        let (_d, work, sb) = workdir(sandboxed);
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         rt.block_on(run_command(
             &cmd,
-            d.path(),
+            &work,
             Duration::from_secs(secs),
             &CancellationToken::new(),
             &mut |_| {},
+            sb.as_ref(),
         ))
     }
 
     #[cfg(windows)]
     #[test]
     fn runs_commands_and_reports_exit_codes() {
+        for sandboxed in [false, true] {
+            exit_codes(&|c, s| run_in(c, s, sandboxed));
+        }
+    }
+
+    #[cfg(windows)]
+    fn exit_codes(run: &dyn Fn(VerifyCommand, u64) -> CommandResult) {
         let ok = run(
             VerifyCommand::new(VerifyKind::Build, "echo built \"with quotes\" && echo warn 1>&2"),
             20,
@@ -895,6 +978,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn timeouts_fail_builds_but_pass_runs_that_keep_running() {
+        for sandboxed in [false, true] {
+            timeouts(&|c, s| run_in(c, s, sandboxed));
+        }
+    }
+
+    #[cfg(windows)]
+    fn timeouts(run: &dyn Fn(VerifyCommand, u64) -> CommandResult) {
         let slow = "ping -n 30 127.0.0.1 >nul";
         let b = run(VerifyCommand::new(VerifyKind::Build, slow), 1);
         assert!(b.timed_out && !b.passed && b.duration_ms < 10_000, "{b:?}");
@@ -916,7 +1006,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn cancel_kills_the_process_tree() {
-        let d = tempfile::tempdir().unwrap();
+        for sandboxed in [false, true] {
+            cancel_tree(sandboxed);
+        }
+    }
+
+    #[cfg(windows)]
+    fn cancel_tree(sandboxed: bool) {
+        let (_d, work, sb) = workdir(sandboxed);
         let cancel = CancellationToken::new();
         let c2 = cancel.clone();
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
@@ -927,14 +1024,15 @@ mod tests {
             });
             run_command(
                 &VerifyCommand::new(VerifyKind::Build, "ping -n 30 127.0.0.1"),
-                d.path(),
+                &work,
                 Duration::from_secs(60),
                 &cancel,
                 &mut |_| {},
+                sb.as_ref(),
             )
             .await
         });
-        assert!(r.cancelled && !r.passed && r.duration_ms < 10_000, "{r:?}");
+        assert!(r.cancelled && !r.passed && r.duration_ms < 10_000, "sandboxed={sandboxed}: {r:?}");
     }
 
     #[test]

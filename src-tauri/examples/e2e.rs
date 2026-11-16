@@ -202,6 +202,379 @@ fn set_script(path: &Path, rules: serde_json::Value) {
     std::fs::write(path, rules.to_string()).unwrap();
 }
 
+/// `loop-real` (GPU): the self-reliant loop on the real models. The local planner writes a spec
+/// on each of the three models (tool calls and thinking through each chat template); Qwen3.6
+/// then runs the whole loop on its spec under secure autopilot (sandboxed cargo build/test,
+/// fix rounds, review); finally a project with a type error the spec doesn't mention forces a
+/// real `cargo build` fix round. Specs and reports go to `%TEMP%\relay-e2e\real-loop\`.
+async fn real_loop(core: &AppCore, base: &Path, c: &mut Checks) {
+    let dir = base.join("real-loop-project");
+    let out = base.join("real-loop");
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).unwrap();
+    let make = |broken: bool| {
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"textkit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        let count = if broken {
+            "/// Number of characters (not bytes) in `s`.\npub fn char_count(s: &str) -> u32 {\n    s.chars().count()\n}\n"
+        } else {
+            "/// Number of characters (not bytes) in `s`.\npub fn char_count(s: &str) -> u32 {\n    s.chars().count() as u32\n}\n"
+        };
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            format!(
+                "//! Small text utilities.\n\n/// Collapse runs of whitespace into single spaces and trim both ends.\npub fn normalize_spaces(s: &str) -> String {{\n    s.split_whitespace().collect::<Vec<_>>().join(\" \")\n}}\n\n{count}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tests/basic.rs"),
+            "use textkit::*;\n\n#[test]\nfn normalizes() {\n    assert_eq!(normalize_spaces(\"  a \\t b\\n\"), \"a b\");\n}\n\n#[test]\nfn counts_chars() {\n    assert_eq!(char_count(\"héllo\"), 5);\n}\n",
+        )
+        .unwrap();
+    };
+    let root = dir.to_string_lossy().into_owned();
+    let instruction = "Add a `parse_duration` function to the library that turns strings like \"1h30m\", \"45s\" or \"2h5m10s\" into a number of seconds, and rejects empty or malformed input with an error. Cover it with tests.";
+    let mut s = core.settings();
+    s.planner_backend = relay_lib::config::PlannerBackend::Local;
+    s.planner_tools = true;
+    s.coder_profile = "qwen3.6-35b-a3b".into();
+    s.verify_enabled = true;
+    s.loop_review = true;
+    s.follow_up_rounds = 1;
+    s.max_fix_rounds = 3;
+    s.autopilot = true;
+    s.autopilot_secure = true;
+    s.sandbox_all_runs = false;
+    core.set_settings(s).unwrap();
+    let step_lines = |w: &relay_lib::workflow::WorkflowReport| -> Vec<String> {
+        w.steps
+            .iter()
+            .map(|s| format!("{:?} {} ok={} — {}", s.kind, s.label, s.ok, s.detail))
+            .collect()
+    };
+
+    println!("\n== loop-real 1: the local planner on each model (thinking + read-only tools)");
+    let mut qwen36_spec = None;
+    for planner in ["qwen3.8-27b", "gpt-oss-20b", "qwen3.6-35b-a3b"] {
+        make(false);
+        let mut s = core.settings();
+        s.planner_profile = planner.into();
+        core.set_settings(s).unwrap();
+        let t = Instant::now();
+        match core
+            .expand(ExpandRequest {
+                job_id: format!("job-real-plan-{planner}"),
+                instruction: instruction.into(),
+                project_root: root.clone(),
+                context_files: vec![],
+                profile_id: "qwen3.6-35b-a3b".into(),
+            })
+            .await
+        {
+            Ok(ex) => {
+                std::fs::write(out.join(format!("spec-{planner}.md")), &ex.spec).unwrap();
+                let p = &ex.parsed;
+                let fences = ex.spec.matches("```").count();
+                println!(
+                    "     {planner}: {:.0}s, {:.0} tok/s, tools {:?}, files {:?}, verification {:?}, warnings {:?}, {} fence(s)",
+                    t.elapsed().as_secs_f64(),
+                    ex.claude.tok_per_sec.unwrap_or(0.0),
+                    ex.claude.tool_calls,
+                    p.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+                    p.verification.iter().map(|v| v.command.clone()).collect::<Vec<_>>(),
+                    ex.warnings,
+                    fences / 2
+                );
+                c.check(
+                    ex.claude.backend == "local" && !ex.claude.cancelled && !p.files.is_empty(),
+                    format!(
+                        "{planner} wrote a spec that names {} file(s) in {:.0}s",
+                        p.files.len(),
+                        t.elapsed().as_secs_f64()
+                    ),
+                );
+                // The whole project fits the planner's source overview, so a tool call is the
+                // model's choice, not a requirement.
+                println!("  INFO  {planner} tool calls: {:?}", ex.claude.tool_calls);
+                c.check(
+                    fences == 0,
+                    format!("{planner}'s spec has no code blocks (design only; {} fence(s))", fences / 2),
+                );
+                if planner == "qwen3.6-35b-a3b" {
+                    qwen36_spec = Some(ex.spec.clone());
+                }
+            }
+            Err(e) => c.check(false, format!("{planner} as planner failed: {e:#}")),
+        }
+    }
+
+    println!("\n== loop-real 2: Qwen3.6 plans and codes, secure autopilot (sandboxed build/test, fixes, review)");
+    if let Some(spec) = qwen36_spec {
+        make(false);
+        let chk = core.autopilot_check(&root, &spec);
+        println!(
+            "     commands {:?}, blocked {:?}",
+            chk.commands.iter().map(|v| v.command.clone()).collect::<Vec<_>>(),
+            chk.blocked
+        );
+        c.check(
+            chk.blocked.is_empty() && chk.sandboxed,
+            format!(
+                "secure mode lets the planner's commands run unattended ({} blocked)",
+                chk.blocked.len()
+            ),
+        );
+        let t = Instant::now();
+        let cmd = ImplementCommand {
+            job_id: "job-real-plan-qwen3.6-35b-a3b".into(),
+            run_id: Some("run-real-loop".into()),
+            project_root: root.clone(),
+            instruction: instruction.into(),
+            spec: spec.clone(),
+            context_files: vec![],
+            full_context: vec![],
+            mode: None,
+            profile_id: "qwen3.6-35b-a3b".into(),
+            autopilot: chk.blocked.is_empty(),
+        };
+        match core.implement(cmd).await {
+            Ok(resp) => {
+                let r = &resp.result;
+                let w = r.workflow.clone().unwrap_or_default();
+                let lines = step_lines(&w);
+                for l in &lines {
+                    println!("     {l}");
+                }
+                std::fs::write(out.join("loop-report.json"), serde_json::to_string_pretty(&resp).unwrap()).unwrap();
+                let fixes = w.steps.iter().filter(|s| s.kind == relay_lib::workflow::StepKind::Fix).count();
+                println!(
+                    "     outcome: {} in {:.0}s, coder {:.0} tok/s avg, {fixes} fix round(s), review: {:?}",
+                    w.outcome,
+                    t.elapsed().as_secs_f64(),
+                    r.avg_tok_per_sec.unwrap_or(0.0),
+                    w.review.as_ref().map(|rv| rv.passed)
+                );
+                c.check(
+                    w.sandboxed && !w.steps.is_empty() && r.error.is_none(),
+                    format!("the loop ran to the end, sandboxed: {}", w.outcome),
+                );
+                c.check(
+                    w.verified == Some(true),
+                    format!("the change builds and its tests pass ({fixes} fix round(s))"),
+                );
+                c.check(
+                    w.review.as_ref().is_some_and(|rv| rv.passed),
+                    format!(
+                        "the planner's final review passes: {:?}",
+                        w.review.as_ref().map(|rv| rv.verdict.clone())
+                    ),
+                );
+            }
+            Err(e) => c.check(false, format!("loop failed: {e:#}")),
+        }
+    }
+
+    println!("\n== loop-real 3: a type error the spec doesn't mention forces a real cargo fix round");
+    make(true);
+    let spec = "## Summary\nAdd `word_count` to the library.\n\n## Design\n- `pub fn word_count(s: &str) -> usize` in `src/lib.rs`: the number of whitespace-separated words, consistent with how `normalize_spaces` splits.\n\n## Files\n- `src/lib.rs` (modify) — add `word_count`\n\n## Changes\n### `src/lib.rs`\nAdd `word_count` after `normalize_spaces`, with a doc comment. Leave the other functions as they are.\n\n## Edge cases\n- An empty or all-whitespace string has 0 words.\n\n## Acceptance criteria\n- `word_count(\"a  b\\tc\")` is 3.\n\n## Verification\n- build: `cargo build`\n- test: `cargo test -q`\n";
+    let mut s = core.settings();
+    s.loop_review = false;
+    core.set_settings(s).unwrap();
+    let t = Instant::now();
+    let cmd = ImplementCommand {
+        job_id: "job-real-fix".into(),
+        run_id: Some("run-real-fix".into()),
+        project_root: root.clone(),
+        instruction: "add word_count".into(),
+        spec: spec.into(),
+        context_files: vec![],
+        full_context: vec![],
+        mode: None,
+        profile_id: "qwen3.6-35b-a3b".into(),
+        autopilot: true,
+    };
+    match core.implement(cmd).await {
+        Ok(resp) => {
+            let w = resp.result.workflow.clone().unwrap_or_default();
+            for l in step_lines(&w) {
+                println!("     {l}");
+            }
+            std::fs::write(out.join("fix-report.json"), serde_json::to_string_pretty(&resp).unwrap()).unwrap();
+            let first = w.steps.iter().find(|s| s.kind == relay_lib::workflow::StepKind::Verify);
+            let fixes = w.steps.iter().filter(|s| s.kind == relay_lib::workflow::StepKind::Fix).count();
+            c.check(
+                first.is_some_and(|s| !s.ok && s.detail.contains("cargo build")),
+                format!(
+                    "the first sandboxed build fails on the type error: {:?}",
+                    first.map(|s| s.detail.clone())
+                ),
+            );
+            c.check(
+                fixes >= 1 && w.verified == Some(true),
+                format!(
+                    "the coder fixed it from the compiler output ({fixes} fix round(s), {:.0}s): {}",
+                    t.elapsed().as_secs_f64(),
+                    w.outcome
+                ),
+            );
+        }
+        Err(e) => c.check(false, format!("fix-round run failed: {e:#}")),
+    }
+}
+
+/// Slice g, secure autopilot: a spec whose commands are not allowlisted is refused before any
+/// model work; an allowed one runs `cargo build` / `cargo test` sandboxed, and a test of the
+/// project that tries to write into the real project folder finds it can't.
+async fn secure_autopilot(core: &AppCore, base: &Path, script: &Path, c: &mut Checks) {
+    println!("\n== Slice g: autopilot secure mode (allowlist + Low integrity sandbox)");
+    let dir = base.join("secure-project");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"sbx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn double(x: u32) -> u32 {\n    x\n}\n").unwrap();
+    let escape = dir.canonicalize().unwrap().join("escaped.txt");
+    let escape = escape.to_string_lossy().trim_start_matches(r"\\?\").to_string();
+    std::fs::write(
+        dir.join("tests/sandbox.rs"),
+        format!(
+            "#[test]\nfn doubles() {{\n    assert_eq!(sbx::double(2), 4);\n}}\n\n#[test]\nfn cannot_write_into_the_project() {{\n    assert!(std::fs::write(r\"{escape}\", \"escaped\").is_err(), \"wrote outside the staging copy\");\n}}\n"
+        ),
+    )
+    .unwrap();
+    let root = dir.to_string_lossy().into_owned();
+    let spec_with = |verification: &str| {
+        format!(
+            "## Summary\nFix `double`.\n\n## Design\n- `double(x: u32) -> u32` in `src/lib.rs`.\n\n## Files\n- `src/lib.rs` (modify) — the function\n\n## Changes\n### `src/lib.rs`\nReturn twice the input.\n\n## Edge cases\n- None.\n\n## Acceptance criteria\n- The tests pass.\n\n## Verification\n{verification}"
+        )
+    };
+    let good = spec_with("- build: `cargo build`\n- test: `cargo test -q`\n");
+    let bad = spec_with("- build: `cargo build`\n- test: `cargo test -q && del /q src\\*.rs`\n");
+    set_script(
+        script,
+        serde_json::json!([
+            {"contains": "Return twice the input", "response": "src/lib.rs\n<<<<<<< SEARCH\npub fn double(x: u32) -> u32 {\n    x\n}\n=======\npub fn double(x: u32) -> u32 {\n    x * 2\n}\n>>>>>>> REPLACE\n"},
+        ]),
+    );
+    let mut s = core.settings();
+    s.planner_profile = "qwen3.6-35b-a3b".into();
+    s.coder_profile = "qwen3.6-35b-a3b".into();
+    s.verify_enabled = true;
+    s.loop_review = false;
+    s.follow_up_rounds = 0;
+    s.autopilot = true;
+    s.autopilot_secure = true;
+    s.sandbox_all_runs = false;
+    core.set_settings(s).unwrap();
+    let cmd = |run: &str, spec: &str, autopilot: bool| ImplementCommand {
+        job_id: "job-secure".into(),
+        run_id: Some(run.into()),
+        project_root: root.clone(),
+        instruction: "fix double".into(),
+        spec: spec.into(),
+        context_files: vec![],
+        full_context: vec![],
+        mode: None,
+        profile_id: "qwen3.6-35b-a3b".into(),
+        autopilot,
+    };
+
+    let chk = core.autopilot_check(&root, &bad);
+    c.check(
+        chk.secure && chk.blocked.len() == 1 && chk.blocked[0].reason.contains("`&`"),
+        format!("autopilot check blocks the chained command: {:?}", chk.blocked),
+    );
+    let t = Instant::now();
+    match core.implement(cmd("run-secure-blocked", &bad, true)).await {
+        Err(e) => c.check(
+            e.to_string().starts_with(relay_lib::sandbox::AUTOPILOT_BLOCKED) && t.elapsed() < Duration::from_secs(2),
+            format!(
+                "an autopilot run with a blocked command is refused up front ({:.1}s): {e}",
+                t.elapsed().as_secs_f64()
+            ),
+        ),
+        Ok(r) => c.check(
+            false,
+            format!(
+                "blocked autopilot run went ahead: {}",
+                r.result.workflow.map(|w| w.outcome).unwrap_or_default()
+            ),
+        ),
+    }
+
+    let chk = core.autopilot_check(&root, &good);
+    c.check(
+        chk.blocked.is_empty() && chk.sandboxed && chk.commands.len() == 2,
+        format!("autopilot check allows cargo build/test, sandboxed ({:?})", chk.blocked),
+    );
+    let t = Instant::now();
+    match core.implement(cmd("run-secure", &good, true)).await {
+        Ok(resp) => {
+            let w = resp.result.workflow.clone().unwrap_or_default();
+            for s in &w.steps {
+                println!("     step {:?} {} ok={} — {}", s.kind, s.label, s.ok, s.detail);
+            }
+            c.check(
+                w.sandboxed && w.verified == Some(true),
+                format!(
+                    "secure autopilot run verified in the sandbox in {:.1}s: {}",
+                    t.elapsed().as_secs_f64(),
+                    w.outcome
+                ),
+            );
+            let tests = w
+                .steps
+                .iter()
+                .flat_map(|s| s.commands.iter())
+                .find(|r| r.command == "cargo test -q");
+            c.check(
+                tests.is_some_and(|r| r.passed),
+                "the project's own test could not write into the real project folder",
+            );
+            c.check(
+                resp.result.files.iter().any(|f| f.path == "src/lib.rs"),
+                "the coder's change is proposed for review",
+            );
+        }
+        Err(e) => c.check(false, format!("secure autopilot run failed: {e:#}")),
+    }
+    c.check(!Path::new(&escape).exists(), "nothing was written into the project folder");
+    c.check(
+        std::fs::read_to_string(dir.join("src/lib.rs")).unwrap().contains("    x\n"),
+        "the project is untouched until accepted",
+    );
+
+    // A reviewed run is not sandboxed unless Settings say so.
+    let mut s = core.settings();
+    s.autopilot = false;
+    s.sandbox_all_runs = true;
+    core.set_settings(s).unwrap();
+    match core.implement(cmd("run-secure-reviewed", &good, false)).await {
+        Ok(resp) => {
+            let w = resp.result.workflow.unwrap_or_default();
+            c.check(
+                w.sandboxed && w.verified == Some(true),
+                format!("'sandbox reviewed runs too' sandboxes a reviewed run: {}", w.outcome),
+            );
+        }
+        Err(e) => c.check(false, format!("reviewed sandboxed run failed: {e:#}")),
+    }
+    let mut s = core.settings();
+    s.sandbox_all_runs = false;
+    core.set_settings(s).unwrap();
+}
+
 async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
     let sink: Sink = Arc::new(PrintSink { verbose_deltas: false });
     let core = AppCore::new(sink).expect("core");
@@ -216,7 +589,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
     // ---- configure ----------------------------------------------------------------------------
     let mut settings = core.settings();
     let mut profiles = core.profiles();
-    if mode == "real" {
+    if mode == "real" || mode == "loop-real" {
         settings.llama_server_path =
             std::env::var("RELAY_LLAMA_SERVER").unwrap_or_else(|_| r"D:\LocalAI-models\llama.cpp-b12360\bin\llama-server.exe".into());
         settings.models_dir = std::env::var("RELAY_MODELS_DIR").unwrap_or_else(|_| r"D:\LocalAI-models".into());
@@ -246,6 +619,16 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
     settings.planner_backend = relay_lib::config::PlannerBackend::Claude;
     core.set_settings(settings.clone()).unwrap();
     core.set_profiles(profiles.clone()).unwrap();
+
+    if mode == "loop-real" {
+        real_loop(&core, base, &mut c).await;
+        core.shutdown().await;
+        println!("\n{} passed, {} failed", c.passed.len(), c.failed.len());
+        for f in &c.failed {
+            println!("  FAILED: {f}");
+        }
+        return if c.failed.is_empty() { 0 } else { 1 };
+    }
 
     // ---- slice a: managed server + hard-coded spec + apply --------------------------------------
     println!("\n== Slice a: managed llama-server for Qwen3.8-27B, hard-coded spec, apply");
@@ -323,6 +706,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
             spec: RETRY_SPEC.into(),
             context_files: vec!["src/models.py".into()],
             full_context: vec![],
+            autopilot: false,
             mode: None,
             profile_id: "qwen3.8-27b".into(),
         })
@@ -348,6 +732,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
             spec: RETRY_SPEC.into(),
             context_files: vec!["src/models.py".into()],
             full_context: vec![],
+            autopilot: false,
             mode: None,
             profile_id: "qwen3.8-27b".into(),
         })
@@ -428,6 +813,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                 spec: spec.into(),
                 context_files: vec![],
                 full_context: vec![],
+                autopilot: false,
                 mode: None,
                 profile_id: "qwen3.8-27b".into(),
             })
@@ -464,6 +850,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                 spec: spec.into(),
                 context_files: vec![],
                 full_context: vec![],
+                autopilot: false,
                 mode: None,
                 profile_id: "qwen3.8-27b".into(),
             })
@@ -489,6 +876,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                 spec: "## Summary\nx\n".into(),
                 context_files: vec![],
                 full_context: vec![],
+                autopilot: false,
                 mode: None,
                 profile_id: "qwen3.8-27b".into(),
             })
@@ -584,6 +972,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                 spec: RETRY_SPEC.into(),
                 context_files: vec![],
                 full_context: vec![],
+                autopilot: false,
                 mode: None,
                 profile_id: "lmstudio".into(),
             })
@@ -630,6 +1019,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                 spec: spec.into(),
                 context_files: vec![],
                 full_context: vec![],
+                autopilot: false,
                 mode: None,
                 profile_id: "tiny-ctx".into(),
             })
@@ -742,6 +1132,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
             spec: pspec.into(),
             context_files: pctx.clone(),
             full_context: pctx.clone(),
+            autopilot: false,
             mode: Some(SplitMode::PerFile),
             profile_id: "fake-recurrent".into(),
         };
@@ -787,6 +1178,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                 spec: RETRY_SPEC.into(),
                 context_files: vec![],
                 full_context: vec![],
+                autopilot: false,
                 mode: None,
                 profile_id: "gpt-oss-20b".into(),
             })
@@ -936,6 +1328,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
             spec: loop_spec.into(),
             context_files: vec![],
             full_context: vec![],
+            autopilot: false,
             mode: None,
             profile_id: "qwen3.6-35b-a3b".into(),
         };
@@ -1073,6 +1466,8 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
         let follow = resp.result.calls.iter().find(|c| c.label.as_deref() == Some("Follow-up 1"));
         c.check(follow.is_some_and(|c| c.ok), "the coder's model was loaded again for the follow-up");
 
+        secure_autopilot(&core, base, script, &mut c).await;
+
         // Back to the plain path for the remaining slices.
         let mut s = core.settings();
         s.planner_backend = relay_lib::config::PlannerBackend::Claude;
@@ -1126,6 +1521,7 @@ async fn run(mode: &str, base: &Path, script: &Path) -> i32 {
                             spec: ex.spec.clone(),
                             context_files: vec![],
                             full_context: vec![],
+                            autopilot: false,
                             mode: None,
                             profile_id: "qwen3.8-27b".into(),
                         })

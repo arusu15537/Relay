@@ -20,7 +20,7 @@ window can stay in the background (no screen capture, no mouse).
    node tools\uitest\uitest-claude.mjs C:\tmp\shots   :: real Claude CLI expansion + review (fake local model)
    node tools\uitest\uitest-prewarm.mjs C:\tmp\shots  :: exact token counts + prewarm (needs a `fake-recurrent` profile, see below)
    node tools\uitest\uitest-real.mjs   C:\tmp\shots   :: real Claude + all three real models (GPU)
-   node tools\uitest\uitest-loop.mjs   C:\tmp\shots   :: local planner (tool call) → verification chips → build fails → fix → review → follow-up → PASS → accept; autopilot
+   node tools\uitest\uitest-loop.mjs   C:\tmp\shots   :: local planner (tool call) → verification chips → build fails → fix → review → follow-up → PASS → accept; autopilot (secure mode pauses at the spec, then without secure mode)
    ```
 
 `uitest-loop.mjs` scripts the fake server's answers: start Relay with `$env:FAKE_LLM_SCRIPT = "$env:TEMP\relay-uitest\fake-script.json"`

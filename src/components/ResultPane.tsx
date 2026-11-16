@@ -56,6 +56,7 @@ function WorkflowPanel({ w }: { w: WorkflowReport }) {
         <b>{w.outcome || "Loop finished"}</b>
         <span className="faint" style={{ fontSize: 12 }}>
           planner {w.planner} · coder {w.coder}
+          {w.sandboxed ? " · commands sandboxed (Low integrity)" : ""}
         </span>
         <span style={{ flex: 1 }} />
         {w.stagingDir && (
